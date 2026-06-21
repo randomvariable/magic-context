@@ -1,4 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
+import { callBackend, invokeTauri } from "./backend";
+import { isTauriRuntime } from "./runtime";
 import type {
   CacheEvent,
   Compartment,
@@ -37,7 +38,7 @@ import type {
 // ── Memory API ──────────────────────────────────────────────
 
 export async function getProjects(): Promise<import("./types").ProjectInfo[]> {
-  return invoke("get_projects");
+  return callBackend("get_projects");
 }
 
 export async function getMemories(params?: {
@@ -49,7 +50,7 @@ export async function getMemories(params?: {
   limit?: number;
   offset?: number;
 }): Promise<Memory[]> {
-  return invoke("get_memories", {
+  return callBackend("get_memories", {
     project: params?.project ?? null,
     workspaceId: params?.workspaceId ?? null,
     status: params?.status ?? null,
@@ -64,34 +65,34 @@ export async function getMemoryStats(params?: {
   project?: string;
   workspaceId?: number;
 }): Promise<MemoryStats> {
-  return invoke("get_memory_stats", {
+  return callBackend("get_memory_stats", {
     project: params?.project ?? null,
     workspaceId: params?.workspaceId ?? null,
   });
 }
 
 export async function workspaceSchemaReady(): Promise<boolean> {
-  return invoke("workspace_schema_ready");
+  return invokeTauri("workspace_schema_ready");
 }
 
 export async function listWorkspaces(): Promise<WorkspaceListItem[]> {
-  return invoke("list_workspaces");
+  return invokeTauri("list_workspaces");
 }
 
 export async function listWorkspaceSummaries(): Promise<WorkspaceSummary[]> {
-  return invoke("list_workspace_summaries");
+  return invokeTauri("list_workspace_summaries");
 }
 
 export async function createWorkspace(name: string): Promise<number> {
-  return invoke("create_workspace", { name });
+  return invokeTauri("create_workspace", { name });
 }
 
 export async function renameWorkspace(workspaceId: number, name: string): Promise<void> {
-  return invoke("rename_workspace", { workspaceId, name });
+  return invokeTauri("rename_workspace", { workspaceId, name });
 }
 
 export async function deleteWorkspace(workspaceId: number): Promise<void> {
-  return invoke("delete_workspace", { workspaceId });
+  return invokeTauri("delete_workspace", { workspaceId });
 }
 
 export interface WorkspaceMemberChange {
@@ -113,37 +114,37 @@ export async function applyWorkspaceChanges(params: {
   setDisplayNames: WorkspaceDisplayNameChange[];
   shareCategories: WorkspaceShareCategory[];
 }): Promise<void> {
-  return invoke("apply_workspace_changes", params);
+  return invokeTauri("apply_workspace_changes", params);
 }
 
 export async function updateMemoryStatus(memoryId: number, status: string): Promise<void> {
-  return invoke("update_memory_status", { memoryId, status });
+  return callBackend("update_memory_status", { memoryId, status });
 }
 
 export async function updateMemoryContent(memoryId: number, content: string): Promise<void> {
-  return invoke("update_memory_content", { memoryId, content });
+  return callBackend("update_memory_content", { memoryId, content });
 }
 
 export async function updateMemoryCategory(memoryId: number, category: string): Promise<void> {
-  return invoke("update_memory_category", { memoryId, category });
+  return callBackend("update_memory_category", { memoryId, category });
 }
 
 export async function deleteMemory(memoryId: number): Promise<void> {
-  return invoke("delete_memory", { memoryId });
+  return callBackend("delete_memory", { memoryId });
 }
 
 export async function bulkUpdateMemoryStatus(memoryIds: number[], status: string): Promise<number> {
-  return invoke("bulk_update_memory_status", { memoryIds, status });
+  return callBackend("bulk_update_memory_status", { memoryIds, status });
 }
 
 export async function bulkDeleteMemory(memoryIds: number[]): Promise<number> {
-  return invoke("bulk_delete_memory", { memoryIds });
+  return callBackend("bulk_delete_memory", { memoryIds });
 }
 
 // ── Session API ─────────────────────────────────────────────
 
 export async function getSessions(): Promise<SessionSummary[]> {
-  return invoke("get_sessions");
+  return callBackend("get_sessions");
 }
 
 export async function listSessions(filter?: SessionFilter): Promise<SessionRow[]> {
@@ -157,7 +158,7 @@ export async function listSessions(filter?: SessionFilter): Promise<SessionRow[]
   // `false` via truthy check.
   if (typeof filter?.is_subagent === "boolean") sanitized.is_subagent = filter.is_subagent;
 
-  return invoke("list_sessions", {
+  return callBackend("list_sessions", {
     filter: Object.keys(sanitized).length > 0 ? sanitized : null,
   });
 }
@@ -176,7 +177,7 @@ function sanitizeSessionFilter(filter?: SessionFilter): SessionFilter {
 export async function listSessionsPaged(filter?: SessionFilter): Promise<PagedSessions> {
   const sanitized = sanitizeSessionFilter(filter);
 
-  return invoke("list_sessions_paged", {
+  return callBackend("list_sessions_paged", {
     filter: Object.keys(sanitized).length > 0 ? sanitized : null,
   });
 }
@@ -185,15 +186,15 @@ export async function getSessionDetail(
   harness: Harness,
   sessionId: string,
 ): Promise<SessionDetail> {
-  return invoke("get_session_detail", { harness, sessionId });
+  return callBackend("get_session_detail", { harness, sessionId });
 }
 
 export async function getSubagentInvocations(sessionId: string): Promise<SubagentInvocation[]> {
-  return invoke("get_subagent_invocations", { sessionId });
+  return callBackend("get_subagent_invocations", { sessionId });
 }
 
 export async function getSubagentTotalsBySubagent(sessionId: string): Promise<SubagentTotals[]> {
-  return invoke("get_subagent_totals_by_subagent", { sessionId });
+  return callBackend("get_subagent_totals_by_subagent", { sessionId });
 }
 
 export async function getSessionCacheEvents(
@@ -211,10 +212,14 @@ export async function getSessionCacheEvents(
   // correctly; dedupe by message_id). `limit` is ignored when this is set.
   sinceTimestamp?: number | null,
 ): Promise<DbCacheEvent[]> {
-  return invoke("get_session_cache_events", {
+  return callBackend("get_session_cache_events", {
     harness,
     sessionId,
-    limit,
+    ...(isTauriRuntime()
+      ? typeof limit === "number"
+        ? { limit }
+        : {}
+      : { limit: limit ?? 600 }),
     sinceTimestamp: sinceTimestamp ?? null,
   });
 }
@@ -229,7 +234,7 @@ export async function getSessionCacheEventsByTurns(
   sessionId: string,
   targetTurns: number,
 ): Promise<DbCacheEvent[]> {
-  return invoke("get_session_cache_events_by_turns", {
+  return callBackend("get_session_cache_events_by_turns", {
     harness,
     sessionId,
     targetTurns,
@@ -246,123 +251,123 @@ export async function getSessionMessages(
   harness: Harness,
   sessionId: string,
 ): Promise<SessionMessageRow[]> {
-  return invoke("get_session_messages", { harness, sessionId });
+  return callBackend("get_session_messages", { harness, sessionId });
 }
 
 export async function getProjectKeyFiles(projectPath: string): Promise<KeyFileRow[]> {
-  return invoke("get_project_key_files", { projectPath });
+  return callBackend("get_project_key_files", { projectPath });
 }
 
 export async function enumerateProjects(): Promise<ProjectRow[]> {
-  return invoke("enumerate_projects");
+  return invokeTauri("enumerate_projects");
 }
 
 export async function enumerateMemoryProjects(): Promise<ProjectRow[]> {
-  return invoke("enumerate_memory_projects");
+  return invokeTauri("enumerate_memory_projects");
 }
 
 export async function getCompartments(sessionId: string): Promise<Compartment[]> {
-  return invoke("get_compartments", { sessionId });
+  return callBackend("get_compartments", { sessionId });
 }
 
 export async function getSessionFacts(sessionId: string): Promise<SessionFact[]> {
-  return invoke("get_session_facts", { sessionId });
+  return invokeTauri("get_session_facts", { sessionId });
 }
 
 export async function getSessionNotes(sessionId: string): Promise<Note[]> {
-  return invoke("get_session_notes", { sessionId });
+  return invokeTauri("get_session_notes", { sessionId });
 }
 
 export async function getSmartNotes(projectPath: string): Promise<Note[]> {
-  return invoke("get_smart_notes", { projectPath });
+  return callBackend("get_smart_notes", { projectPath });
 }
 
 export async function updateSessionFact(factId: number, content: string): Promise<void> {
-  return invoke("update_session_fact", { factId, content });
+  return callBackend("update_session_fact", { factId, content });
 }
 
 export async function deleteSessionFact(factId: number): Promise<void> {
-  return invoke("delete_session_fact", { factId });
+  return callBackend("delete_session_fact", { factId });
 }
 
 export async function updateNote(noteId: number, content: string): Promise<void> {
-  return invoke("update_note", { noteId, content });
+  return callBackend("update_note", { noteId, content });
 }
 
 export async function deleteNote(noteId: number): Promise<void> {
-  return invoke("delete_note", { noteId });
+  return callBackend("delete_note", { noteId });
 }
 
 export async function dismissNote(noteId: number): Promise<void> {
-  return invoke("dismiss_note", { noteId });
+  return callBackend("dismiss_note", { noteId });
 }
 
 export async function getSessionMeta(sessionId: string): Promise<SessionMetaRow | null> {
-  return invoke("get_session_meta", { sessionId });
+  return callBackend("get_session_meta", { sessionId });
 }
 
 export async function getContextTokenBreakdown(
   sessionId: string,
 ): Promise<ContextTokenBreakdown | null> {
-  return invoke("get_context_token_breakdown", { sessionId });
+  return invokeTauri("get_context_token_breakdown", { sessionId });
 }
 
 export async function getSessionCacheStats(
   limit?: number,
 ): Promise<import("./types").SessionCacheStats[]> {
-  return invoke("get_session_cache_stats", { maxLines: 5000, limit: limit ?? 5 });
+  return invokeTauri("get_session_cache_stats", { maxLines: 5000, limit: limit ?? 5 });
 }
 
 export async function getSessionCacheStatsFromDb(
   limit?: number,
 ): Promise<import("./types").SessionCacheStats[]> {
-  return invoke("get_session_cache_stats_from_db", { limit: limit ?? 5 });
+  return invokeTauri("get_session_cache_stats_from_db", { limit: limit ?? 5 });
 }
 
 // ── Dreamer API ─────────────────────────────────────────────
 
 export async function getDreamQueue(): Promise<DreamQueueEntry[]> {
-  return invoke("get_dream_queue");
+  return callBackend("get_dream_queue");
 }
 
 export async function getDreamState(): Promise<DreamStateEntry[]> {
-  return invoke("get_dream_state");
+  return callBackend("get_dream_state");
 }
 
 export async function getDreamRuns(projectPath?: string, limit?: number): Promise<DreamRun[]> {
-  return invoke("get_dream_runs", {
+  return callBackend("get_dream_runs", {
     projectPath: projectPath ?? null,
     limit: limit ?? 20,
   });
 }
 
 export async function getDreamRunMemoryChanges(runId: number): Promise<DreamRunMemoryDetail> {
-  return invoke("get_dream_run_memory_changes", { runId });
+  return callBackend("get_dream_run_memory_changes", { runId });
 }
 
 export async function enqueueDream(projectPath: string, reason: string): Promise<number> {
-  return invoke("enqueue_dream", { projectPath, reason });
+  return invokeTauri("enqueue_dream", { projectPath, reason });
 }
 
 export async function deleteDreamQueueEntry(id: number): Promise<number> {
-  return invoke("delete_dream_queue_entry", { id });
+  return invokeTauri("delete_dream_queue_entry", { id });
 }
 
 // ── Log & Cache API ─────────────────────────────────────────
 
 export async function getLogEntries(maxLines?: number): Promise<LogEntry[]> {
-  return invoke("get_log_entries", { maxLines: maxLines ?? 500 });
+  return callBackend("get_log_entries", { maxLines: maxLines ?? null });
 }
 
 export async function getCacheEvents(maxLines?: number): Promise<CacheEvent[]> {
-  return invoke("get_cache_events", { maxLines: maxLines ?? 2000 });
+  return invokeTauri("get_cache_events", { maxLines: maxLines ?? 2000 });
 }
 
 export async function getCacheEventsFromDb(
   limit?: number,
   sinceTimestamp?: number | null,
 ): Promise<DbCacheEvent[]> {
-  return invoke("get_cache_events_from_db", {
+  return callBackend("get_cache_events_from_db", {
     limit: limit ?? 200,
     sinceTimestamp: sinceTimestamp ?? null,
   });
@@ -371,73 +376,94 @@ export async function getCacheEventsFromDb(
 // ── Config API ──────────────────────────────────────────────
 
 export async function getConfig(source: string): Promise<ConfigFile> {
-  return invoke("get_config", { source });
+  return callBackend("get_config", { source });
+}
+
+export async function getProjectConfig(projectPath: string): Promise<ConfigFile> {
+  return callBackend("get_config", { source: "project", projectPath });
 }
 
 export async function saveConfig(source: string, content: string): Promise<void> {
-  return invoke("save_config", { source, content });
+  return callBackend("save_config", { source, content });
 }
 
 export async function getPiConfig(): Promise<ConfigFile> {
-  return invoke("read_pi_config");
+  return callBackend("read_pi_config");
 }
 
 export async function savePiConfig(content: string): Promise<void> {
-  return invoke("write_pi_config", { content });
+  return callBackend("write_pi_config", { content });
 }
 
 // ── Health API ──────────────────────────────────────────────
 
 export async function getDbHealth(): Promise<DbHealth> {
-  return invoke("get_db_health");
+  return callBackend("get_db_health");
 }
 
 export async function getProjectConfigs(): Promise<import("./types").ProjectConfigEntry[]> {
-  return invoke("get_project_configs");
+  return callBackend("get_project_configs");
 }
 
 export async function saveProjectConfig(projectPath: string, content: string): Promise<void> {
-  return invoke("save_project_config", { projectPath, content });
+  return callBackend("save_project_config", { projectPath, content });
 }
 
 export async function getAvailableModels(): Promise<string[]> {
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke("get_available_models");
+  return callBackend("get_available_models");
 }
 
 export async function getAvailablePiModels(): Promise<string[]> {
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke("get_available_pi_models");
+  return callBackend("get_available_pi_models");
+}
+
+export async function testEmbeddingEndpoint(params: {
+  endpoint: string;
+  model: string;
+  apiKey?: string | null;
+  inputType?: string | null;
+  truncate?: string | null;
+}): Promise<unknown> {
+  return callBackend("test_embedding_endpoint", {
+    endpoint: params.endpoint,
+    model: params.model,
+    apiKey: params.apiKey ?? null,
+    inputType: params.inputType ?? null,
+    truncate: params.truncate ?? null,
+  });
 }
 
 // ── User Memory API ─────────────────────────────────────────
 
 export async function getUserMemories(status?: string): Promise<UserMemory[]> {
-  return invoke("get_user_memories", { status: status ?? null });
+  return callBackend("get_user_memories", {
+    status: status ?? null,
+    limit: 200,
+  });
 }
 
 export async function getUserMemoryCandidates(): Promise<UserMemoryCandidate[]> {
-  return invoke("get_user_memory_candidates");
+  return callBackend("get_user_memory_candidates", { limit: 100 });
 }
 
 export async function dismissUserMemory(id: number): Promise<void> {
-  return invoke("dismiss_user_memory", { id });
+  return callBackend("dismiss_user_memory", { id });
 }
 
 export async function deleteUserMemory(id: number): Promise<void> {
-  return invoke("delete_user_memory", { id });
+  return callBackend("delete_user_memory", { id });
 }
 
 export async function updateUserMemoryContent(id: number, content: string): Promise<void> {
-  return invoke("update_user_memory_content", { id, content });
+  return callBackend("update_user_memory_content", { id, content });
 }
 
 export async function deleteUserMemoryCandidate(id: number): Promise<void> {
-  return invoke("delete_user_memory_candidate", { id });
+  return callBackend("delete_user_memory_candidate", { id });
 }
 
 export async function promoteUserMemoryCandidate(id: number): Promise<void> {
-  return invoke("promote_user_memory_candidate", { id });
+  return callBackend("promote_user_memory_candidate", { id });
 }
 
 // ── Utilities ───────────────────────────────────────────────

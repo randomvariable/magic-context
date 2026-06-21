@@ -2,6 +2,7 @@ use crate::embedding_probe::{
     probe_embedding_endpoint, substitute_value, EmbeddingProbeOptions, EmbeddingProbeOutcome,
 };
 use crate::process_ext::NoWindowExtTokio;
+use crate::services;
 use crate::{config, db, log_parser, AppState};
 use tauri::State;
 
@@ -9,7 +10,7 @@ use tauri::State;
 
 #[tauri::command]
 pub fn get_dashboard_schema_warning(state: State<'_, AppState>) -> Option<i64> {
-    state.dashboard_schema_warning_version()
+    services::get_dashboard_schema_warning(&state)
 }
 
 // `(async)` runs this synchronous body on a worker thread instead of the
@@ -19,9 +20,7 @@ pub fn get_dashboard_schema_warning(state: State<'_, AppState>) -> Option<i64> {
 // so the borrowed `State` lifetime is fine.
 #[tauri::command(async)]
 pub fn get_projects(state: State<'_, AppState>) -> Result<Vec<db::ProjectInfo>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_projects(&conn).map_err(|e| e.to_string())
+    services::get_projects(&state)
 }
 
 #[tauri::command(async)]
@@ -141,9 +140,7 @@ pub fn update_memory_status(
     memory_id: i64,
     status: String,
 ) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::update_memory_status(&mut conn, memory_id, &status).map_err(|e| e.to_string())
+    services::update_memory_status(&state, memory_id, status)
 }
 
 #[tauri::command(async)]
@@ -152,9 +149,7 @@ pub fn update_memory_content(
     memory_id: i64,
     content: String,
 ) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::update_memory_content(&mut conn, memory_id, &content).map_err(|e| e.to_string())
+    services::update_memory_content(&state, memory_id, content)
 }
 
 #[tauri::command(async)]
@@ -170,9 +165,7 @@ pub fn update_memory_category(
 
 #[tauri::command(async)]
 pub fn delete_memory(state: State<'_, AppState>, memory_id: i64) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::delete_memory(&mut conn, memory_id).map_err(|e| e.to_string())
+    services::delete_memory(&state, memory_id)
 }
 
 #[tauri::command(async)]
@@ -181,9 +174,7 @@ pub fn bulk_update_memory_status(
     memory_ids: Vec<i64>,
     status: String,
 ) -> Result<usize, String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::bulk_update_memory_status(&mut conn, &memory_ids, &status).map_err(|e| e.to_string())
+    services::bulk_update_memory_status(&state, memory_ids, status)
 }
 
 #[tauri::command(async)]
@@ -191,28 +182,24 @@ pub fn bulk_delete_memory(
     state: State<'_, AppState>,
     memory_ids: Vec<i64>,
 ) -> Result<usize, String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::bulk_delete_memory(&mut conn, &memory_ids).map_err(|e| e.to_string())
+    services::bulk_delete_memory(&state, memory_ids)
 }
 
 // ── Session commands ────────────────────────────────────────
 
 #[tauri::command(async)]
 pub fn get_sessions(state: State<'_, AppState>) -> Result<Vec<db::SessionSummary>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_sessions(&conn).map_err(|e| e.to_string())
+    services::get_sessions(&state)
 }
 
 #[tauri::command(async)]
 pub fn list_sessions(filter: Option<db::SessionFilter>) -> Vec<db::SessionRow> {
-    db::list_all_sessions(filter.unwrap_or_default())
+    services::list_sessions(filter)
 }
 
 #[tauri::command(async)]
 pub fn list_sessions_paged(filter: Option<db::SessionFilter>) -> db::PagedSessions {
-    db::list_sessions_paged(filter.unwrap_or_default())
+    services::list_sessions_paged(filter)
 }
 
 #[tauri::command(async)]
@@ -222,13 +209,7 @@ pub fn get_session_detail(
     session_id: String,
 ) -> Result<db::SessionDetail, String> {
     let harness = harness.parse::<db::Harness>()?;
-    let conn = state
-        .get_db_path()
-        .ok()
-        .and_then(|path| db::open_readonly(&path).ok());
-    db::get_session_detail(conn.as_ref(), harness, &session_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("session not found: {session_id}"))
+    services::get_session_detail(&state, harness, session_id)
 }
 
 #[tauri::command(async)]
@@ -274,9 +255,7 @@ pub fn get_subagent_invocations(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<Vec<db::SubagentInvocation>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_subagent_invocations(&conn, &session_id).map_err(|e| e.to_string())
+    services::get_subagent_invocations(&state, session_id, usize::MAX)
 }
 
 #[tauri::command(async)]
@@ -284,9 +263,7 @@ pub fn get_subagent_totals_by_subagent(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<Vec<db::SubagentTotals>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_subagent_totals_by_subagent(&conn, &session_id).map_err(|e| e.to_string())
+    services::get_subagent_totals_by_subagent(&state, session_id, usize::MAX)
 }
 
 #[tauri::command(async)]
@@ -294,9 +271,7 @@ pub fn get_project_key_files(
     state: State<'_, AppState>,
     project_path: String,
 ) -> Result<Vec<db::KeyFileRow>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_project_key_files(&conn, &project_path).map_err(|e| e.to_string())
+    services::get_project_key_files(&state, project_path, usize::MAX)
 }
 
 #[tauri::command(async)]
@@ -318,9 +293,7 @@ pub fn get_compartments(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<Vec<db::Compartment>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_compartments(&conn, &session_id).map_err(|e| e.to_string())
+    services::get_compartments(&state, session_id, usize::MAX)
 }
 
 #[tauri::command(async)]
@@ -348,9 +321,7 @@ pub fn get_smart_notes(
     state: State<'_, AppState>,
     project_path: String,
 ) -> Result<Vec<db::Note>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_smart_notes(&conn, &project_path).map_err(|e| e.to_string())
+    services::get_smart_notes(&state, project_path, services::SMART_NOTES_LIMIT_MAX)
 }
 
 #[tauri::command(async)]
@@ -359,18 +330,12 @@ pub fn update_session_fact(
     fact_id: i64,
     content: String,
 ) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::update_session_fact(&mut conn, fact_id, &content).map_err(|e| e.to_string())?;
-    Ok(())
+    services::update_session_fact(&state, fact_id, content)
 }
 
 #[tauri::command(async)]
 pub fn delete_session_fact(state: State<'_, AppState>, fact_id: i64) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::delete_session_fact(&mut conn, fact_id).map_err(|e| e.to_string())?;
-    Ok(())
+    services::delete_session_fact(&state, fact_id)
 }
 
 #[tauri::command(async)]
@@ -379,26 +344,17 @@ pub fn update_note(
     note_id: i64,
     content: String,
 ) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::update_note(&conn, note_id, &content).map_err(|e| e.to_string())?;
-    Ok(())
+    services::update_note(&state, note_id, content)
 }
 
 #[tauri::command(async)]
 pub fn delete_note(state: State<'_, AppState>, note_id: i64) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::delete_note(&conn, note_id).map_err(|e| e.to_string())?;
-    Ok(())
+    services::delete_note(&state, note_id)
 }
 
 #[tauri::command(async)]
 pub fn dismiss_note(state: State<'_, AppState>, note_id: i64) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::dismiss_note(&conn, note_id).map_err(|e| e.to_string())?;
-    Ok(())
+    services::dismiss_note(&state, note_id)
 }
 
 #[tauri::command(async)]
@@ -406,9 +362,7 @@ pub fn get_session_meta(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<Option<db::SessionMetaRow>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_session_meta(&conn, &session_id).map_err(|e| e.to_string())
+    services::get_session_meta(&state, session_id)
 }
 
 #[tauri::command(async)]
@@ -425,16 +379,12 @@ pub fn get_context_token_breakdown(
 
 #[tauri::command(async)]
 pub fn get_dream_queue(state: State<'_, AppState>) -> Result<Vec<db::DreamQueueEntry>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_dream_queue(&conn).map_err(|e| e.to_string())
+    crate::services::get_dream_queue(&state)
 }
 
 #[tauri::command(async)]
 pub fn get_dream_state(state: State<'_, AppState>) -> Result<Vec<db::DreamStateEntry>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_dream_state(&conn).map_err(|e| e.to_string())
+    crate::services::get_dream_state(&state, 200)
 }
 
 #[tauri::command(async)]
@@ -443,9 +393,7 @@ pub fn get_dream_runs(
     project_path: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<db::DreamRun>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_dream_runs(&conn, project_path.as_deref(), limit.unwrap_or(20))
+    crate::services::get_dream_runs(&state, project_path, limit.unwrap_or(20))
 }
 
 #[tauri::command(async)]
@@ -453,9 +401,7 @@ pub fn get_dream_run_memory_changes(
     state: State<'_, AppState>,
     run_id: i64,
 ) -> Result<db::DreamRunMemoryDetail, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_dream_run_memory_changes(&conn, run_id)
+    crate::services::get_dream_run_memory_changes(&state, run_id, 200)
 }
 
 #[tauri::command(async)]
@@ -568,328 +514,14 @@ pub fn save_project_config(project_path: String, content: String) -> Result<(), 
 
 // ── Model commands ──────────────────────────────────────────
 
-/// Upper bound for model-discovery subprocesses so a hung CLI shim cannot block
-/// the dashboard worker thread indefinitely.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
-
-/// Run a binary with args, bounded by [`PROBE_TIMEOUT`]. `kill_on_drop` reaps
-/// the child when the future is dropped on timeout so orphans do not accumulate.
-async fn run_bounded_binary(program: &str, args: &[&str]) -> Option<String> {
-    let fut = tokio::process::Command::new(program)
-        .args(args)
-        .no_window()
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(PROBE_TIMEOUT, fut).await {
-        Ok(Ok(output)) if output.status.success() => {
-            Some(String::from_utf8_lossy(&output.stdout).to_string())
-        }
-        _ => None,
-    }
-}
-
-/// Run `command` through the user's login shell and return its stdout on
-/// success. GUI apps don't inherit the shell PATH, and version managers
-/// (mise/nvm/fnm/volta/asdf) install binaries under per-version directories
-/// that cannot be hardcoded — but a login shell resolves them exactly as the
-/// user's terminal does. Bounded by a timeout so a slow/misconfigured shell rc
-/// can't hang the model dropdown. Unix-only: Windows version managers write to
-/// known dirs already covered by the candidate paths, and `-l -c` is not a
-/// portable Windows shell idiom.
-///
-/// Owned `String` arg (not `&str`): this lives in the commands module and an
-/// async fn with a reference input would trip Tauri's command macro rules.
-#[cfg(unix)]
-async fn run_via_login_shell(command: String) -> Option<String> {
-    // Only the user's real login shell carries their version-manager PATH; a
-    // bare /bin/sh fallback wouldn't, so skip when SHELL is unset.
-    let shell = std::env::var("SHELL").ok()?;
-    let fut = tokio::process::Command::new(&shell)
-        .arg("-l")
-        .arg("-c")
-        .arg(&command)
-        .no_window()
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(PROBE_TIMEOUT, fut).await {
-        Ok(Ok(output)) if output.status.success() => {
-            Some(String::from_utf8_lossy(&output.stdout).to_string())
-        }
-        _ => None,
-    }
-}
-
-#[cfg(not(unix))]
-async fn run_via_login_shell(_command: String) -> Option<String> {
-    None
-}
-
-fn pick_first_line(stdout: &str) -> Option<String> {
-    let first_line = stdout.lines().next()?.trim().to_string();
-    if !first_line.is_empty() {
-        Some(first_line)
-    } else {
-        None
-    }
-}
-
-#[cfg(windows)]
-async fn resolve_via_where(tool: &str) -> Option<String> {
-    let fut = tokio::process::Command::new("where.exe")
-        .arg(tool)
-        .no_window()
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(PROBE_TIMEOUT, fut).await {
-        Ok(Ok(output)) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            pick_first_line(&stdout)
-        }
-        _ => None,
-    }
-}
-
-#[cfg(not(windows))]
-async fn resolve_via_where(_tool: &str) -> Option<String> {
-    None
-}
-
 #[tauri::command]
 pub async fn get_available_models() -> Vec<String> {
-    // GUI apps on macOS don't inherit shell PATH; try common locations.
-    //
-    // The first candidate must be `~/.opencode/bin/opencode` because that's
-    // the path the official OpenCode installer (`curl -fsSL ... | bash`)
-    // writes to and it's NOT on the GUI launcher's $PATH on macOS. Without
-    // this candidate, every dashboard model dropdown silently returned
-    // empty for users with a stock OpenCode install — the historian /
-    // dreamer / sidekick fallback "Add fallback model" dropdown would show
-    // "No models found" because `props.models = []`, so `grouped()`
-    // returned no groups and the `<For fallback>` rendered.
-    //
-    // Additional fallback paths cover pre-CI installs, custom installs,
-    // Homebrew on Intel + ARM, and shell-PATH discovery for users who
-    // launched OpenCode from a terminal.
-    let candidates = if cfg!(target_os = "windows") {
-        let userprofile = std::env::var("USERPROFILE").unwrap_or_default();
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
-        let mut list = Vec::new();
-        if !userprofile.is_empty() {
-            list.push(format!("{}\\.opencode\\bin\\opencode.exe", userprofile));
-        }
-        if !appdata.is_empty() {
-            list.push(format!("{}\\npm\\opencode.cmd", appdata));
-            list.push(format!("{}\\npm\\opencode.exe", appdata));
-        }
-        if !localappdata.is_empty() {
-            list.push(format!(
-                "{}\\Microsoft\\WinGet\\Links\\opencode.exe",
-                localappdata
-            ));
-        }
-        if !userprofile.is_empty() {
-            list.push(format!("{}\\scoop\\shims\\opencode.exe", userprofile));
-        }
-        if !localappdata.is_empty() {
-            list.push(format!("{}\\opencode\\bin\\opencode.exe", localappdata));
-        }
-        list.push("opencode".to_string());
-        list.push("opencode.exe".to_string());
-        list
-    } else {
-        let home = std::env::var("HOME").unwrap_or_default();
-        vec![
-            format!("{}/.opencode/bin/opencode", home),
-            "opencode".to_string(),
-            format!("{}/.local/bin/opencode", home),
-            "/usr/local/bin/opencode".to_string(),
-            "/opt/homebrew/bin/opencode".to_string(),
-            format!("{}/.local/share/mise/shims/opencode", home),
-            format!("{}/.asdf/shims/opencode", home),
-            format!("{}/.volta/bin/opencode", home),
-        ]
-    };
-
-    let parse = |text: &str| -> Vec<String> {
-        text.lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect()
-    };
-
-    for bin in &candidates {
-        if let Some(text) = run_bounded_binary(bin, &["models"]).await {
-            let models = parse(&text);
-            if !models.is_empty() {
-                return models;
-            }
-        }
-    }
-
-    if cfg!(target_os = "windows") {
-        if let Some(bin) = resolve_via_where("opencode").await {
-            if let Some(text) = run_bounded_binary(&bin, &["models"]).await {
-                let models = parse(&text);
-                if !models.is_empty() {
-                    return models;
-                }
-            }
-        }
-    }
-
-    // Login-shell fallback for version-manager (mise/nvm/fnm) installs the
-    // hardcoded candidates can't enumerate — see run_via_login_shell.
-    if let Some(text) = run_via_login_shell("opencode models".to_string()).await {
-        return parse(&text);
-    }
-
-    Vec::new()
-}
-
-fn strip_ansi_pi_output(text: &str) -> String {
-    let re = regex::Regex::new(r"\x1b\[[0-9;]*m").expect("ansi strip regex");
-    re.replace_all(text, "").into_owned()
-}
-
-fn pi_provider_token_ok(s: &str) -> bool {
-    let s = s.trim_matches(',');
-    if s.is_empty() || !s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
-        return false;
-    }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
-fn pi_model_token_ok(s: &str) -> bool {
-    let s = s.trim_matches(',');
-    if s.is_empty() || !s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
-        return false;
-    }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
-}
-
-/// Parse `pi --list-models` output into `provider/model` ids.
-///
-/// Mirrors `packages/cli/src/lib/pi-helpers.ts` `parseModelListOutput`: skip
-/// `Usage:`/help lines, detect the header by column content (not blind skip(1)),
-/// validate provider/model token shapes, strip ANSI, and accept slash-joined ids.
-pub fn parse_pi_models_output(text: &str) -> Vec<String> {
-    let mut models = std::collections::BTreeSet::new();
-    for raw_line in strip_ansi_pi_output(text).lines() {
-        let mut line = raw_line.trim().to_string();
-        if line.starts_with('•') || line.starts_with('*') || line.starts_with('-') {
-            line = line
-                .trim_start_matches(['•', '*', '-'])
-                .trim_start()
-                .to_string();
-        }
-        if line.is_empty() || line.to_ascii_lowercase().contains("usage:") {
-            continue;
-        }
-
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        let first = cols.first().copied().unwrap_or("").trim_end_matches(',');
-
-        if first.contains('/') && !first.starts_with("http://") && !first.starts_with("https://") {
-            models.insert(first.to_string());
-            continue;
-        }
-
-        let provider = first;
-        let model = cols.get(1).copied().unwrap_or("").trim_end_matches(',');
-        if provider.eq_ignore_ascii_case("provider") && model.eq_ignore_ascii_case("model") {
-            continue;
-        }
-        if pi_provider_token_ok(provider) && pi_model_token_ok(model) {
-            models.insert(format!("{provider}/{model}"));
-        }
-    }
-    models.into_iter().collect()
+    services::get_available_models().await
 }
 
 #[tauri::command]
 pub async fn get_available_pi_models() -> Vec<String> {
-    // GUI apps on macOS don't inherit shell PATH; try common locations.
-    //
-    // The first candidate is `~/.pi/bin/pi` because that's the path the
-    // official pi-coding-agent installer writes to and it's NOT on the GUI
-    // launcher's $PATH on macOS. Additional fallback paths cover pre-CI
-    // installs, custom installs, Homebrew on Intel + ARM, and shell-PATH
-    // discovery for users who launched from a terminal.
-    let candidates = if cfg!(target_os = "windows") {
-        let userprofile = std::env::var("USERPROFILE").unwrap_or_default();
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
-        let mut list = Vec::new();
-        if !userprofile.is_empty() {
-            list.push(format!("{}\\.pi\\bin\\pi.exe", userprofile));
-        }
-        if !appdata.is_empty() {
-            list.push(format!("{}\\npm\\pi.cmd", appdata));
-            list.push(format!("{}\\npm\\pi.exe", appdata));
-        }
-        if !localappdata.is_empty() {
-            list.push(format!(
-                "{}\\Microsoft\\WinGet\\Links\\pi.exe",
-                localappdata
-            ));
-        }
-        if !userprofile.is_empty() {
-            list.push(format!("{}\\scoop\\shims\\pi.exe", userprofile));
-        }
-        if !localappdata.is_empty() {
-            list.push(format!("{}\\pi\\bin\\pi.exe", localappdata));
-        }
-        list.push("pi".to_string());
-        list.push("pi.exe".to_string());
-        list
-    } else {
-        let home = std::env::var("HOME").unwrap_or_default();
-        vec![
-            format!("{}/.pi/bin/pi", home),
-            "pi".to_string(),
-            format!("{}/.local/bin/pi", home),
-            "/usr/local/bin/pi".to_string(),
-            "/opt/homebrew/bin/pi".to_string(),
-            // Version-manager shim dirs (stable across the managed runtime's
-            // version bumps, unlike the per-version install dir).
-            format!("{}/.local/share/mise/shims/pi", home),
-            format!("{}/.asdf/shims/pi", home),
-            format!("{}/.volta/bin/pi", home),
-        ]
-    };
-
-    for bin in &candidates {
-        if let Some(text) = run_bounded_binary(bin, &["--list-models"]).await {
-            let models = parse_pi_models_output(&text);
-            if !models.is_empty() {
-                return models;
-            }
-        }
-    }
-
-    if cfg!(target_os = "windows") {
-        if let Some(bin) = resolve_via_where("pi").await {
-            if let Some(text) = run_bounded_binary(&bin, &["--list-models"]).await {
-                let models = parse_pi_models_output(&text);
-                if !models.is_empty() {
-                    return models;
-                }
-            }
-        }
-    }
-
-    // Last resort: resolve `pi` through the user's login shell. This is the
-    // universal fallback for version managers (mise/nvm/fnm) that install into
-    // per-version dirs the candidates above can't enumerate — the login shell
-    // carries the same PATH the user's terminal uses to find `pi`.
-    if let Some(text) = run_via_login_shell("pi --list-models".to_string()).await {
-        return parse_pi_models_output(&text);
-    }
-
-    Vec::new()
+    services::get_available_pi_models().await
 }
 
 // ── Embedding test ──────────────────────────────────────────
@@ -990,33 +622,34 @@ pub async fn test_embedding_endpoint(
 pub fn get_user_memories(
     state: State<'_, AppState>,
     status: Option<String>,
+    limit: Option<usize>,
 ) -> Result<Vec<db::UserMemory>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_user_memories(&conn, status.as_deref()).map_err(|e| e.to_string())
+    services::get_user_memories(
+        &state,
+        status,
+        limit.unwrap_or(services::USER_MEMORIES_LIMIT_DEFAULT),
+    )
 }
 
 #[tauri::command(async)]
 pub fn get_user_memory_candidates(
     state: State<'_, AppState>,
+    limit: Option<usize>,
 ) -> Result<Vec<db::UserMemoryCandidate>, String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
-    db::get_user_memory_candidates(&conn).map_err(|e| e.to_string())
+    services::get_user_memory_candidates(
+        &state,
+        limit.unwrap_or(services::USER_MEMORY_CANDIDATES_LIMIT_DEFAULT),
+    )
 }
 
 #[tauri::command(async)]
 pub fn dismiss_user_memory(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::dismiss_user_memory(&mut conn, id).map_err(|e| e.to_string())
+    services::dismiss_user_memory(&state, id)
 }
 
 #[tauri::command(async)]
 pub fn delete_user_memory(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::delete_user_memory(&mut conn, id).map_err(|e| e.to_string())
+    services::delete_user_memory(&state, id)
 }
 
 #[tauri::command(async)]
@@ -1025,61 +658,29 @@ pub fn update_user_memory_content(
     id: i64,
     content: String,
 ) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::update_user_memory_content(&mut conn, id, &content).map_err(|e| e.to_string())
+    services::update_user_memory_content(&state, id, content)
 }
 
 #[tauri::command(async)]
 pub fn delete_user_memory_candidate(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::delete_user_memory_candidate(&conn, id).map_err(|e| e.to_string())
+    services::delete_user_memory_candidate(&state, id)
 }
 
 #[tauri::command(async)]
 pub fn promote_user_memory_candidate(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    let path = state.get_db_path()?;
-    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
-    db::promote_user_memory_candidate(&mut conn, id).map_err(|e| e.to_string())
+    services::promote_user_memory_candidate(&state, id)
 }
 
 // ── Health commands ─────────────────────────────────────────
 
 #[tauri::command(async)]
 pub fn get_db_health(state: State<'_, AppState>) -> db::DbHealth {
-    match state.get_db_path() {
-        Ok(path) => db::get_db_health(&path),
-        Err(_) => db::DbHealth {
-            exists: false,
-            path: "Not found".to_string(),
-            size_bytes: 0,
-            wal_size_bytes: 0,
-            table_counts: Vec::new(),
-        },
-    }
+    services::get_db_health(&state)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_pi_models_output, pick_first_line, run_bounded_binary};
-    use std::time::Instant;
-
-    #[tokio::test]
-    async fn run_bounded_binary_times_out_on_sleep() {
-        let start = Instant::now();
-        let result = if cfg!(windows) {
-            run_bounded_binary("cmd", &["/C", "timeout", "/t", "30", "/nobreak"]).await
-        } else {
-            run_bounded_binary("sleep", &["30"]).await
-        };
-        assert!(result.is_none());
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(12),
-            "probe should return within timeout, took {:?}",
-            start.elapsed()
-        );
-    }
+    use crate::model_discovery::parse_pi_models_output;
 
     #[test]
     fn test_parse_pi_models_output_normal() {
@@ -1131,19 +732,5 @@ mod tests {
         let input = "\x1b[32manthropic\x1b[0m  claude-sonnet-4-5";
         let result = parse_pi_models_output(input);
         assert_eq!(result, vec!["anthropic/claude-sonnet-4-5"]);
-    }
-
-    #[test]
-    fn test_pick_first_line() {
-        assert_eq!(pick_first_line(""), None);
-        assert_eq!(pick_first_line("   \n"), None);
-        assert_eq!(
-            pick_first_line("C:\\bin\\opencode.exe\nC:\\other\\opencode.exe"),
-            Some("C:\\bin\\opencode.exe".to_string())
-        );
-        assert_eq!(
-            pick_first_line("  C:\\bin\\opencode.exe  \n"),
-            Some("C:\\bin\\opencode.exe".to_string())
-        );
     }
 }

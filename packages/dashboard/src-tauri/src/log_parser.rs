@@ -2,6 +2,9 @@ use regex::Regex;
 use serde::Serialize;
 use std::path::PathBuf;
 
+pub const LOG_TAIL_READ_CAP_BYTES: u64 = 1024 * 1024;
+pub const LOG_ENTRY_MESSAGE_MAX_BYTES: usize = 2 * 1024;
+
 /// Harness identifier — must match the strings used by the TypeScript-side
 /// `HarnessId` type (`packages/plugin/src/shared/harness.ts`) and by the
 /// per-harness temp-directory layout defined in
@@ -52,7 +55,7 @@ pub struct LogEntry {
     pub component: String,
     pub session_id: String,
     pub message: String,
-    pub raw: String,
+    pub raw: Option<String>,
     pub cache_read: Option<i64>,
     pub cache_write: Option<i64>,
     pub hit_ratio: Option<f64>,
@@ -93,6 +96,68 @@ lazy_static::lazy_static! {
 
     static ref INPUT_TOKENS_RE: Regex = Regex::new(
         r"tokens\.input=(\d+)"
+    ).unwrap();
+
+    static ref REDACT_PEM_PRIVATE_KEY_RE: Regex = Regex::new(
+        r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
+    ).unwrap();
+    static ref REDACT_URL_CREDENTIALS_RE: Regex = Regex::new(
+        r"(?i)(https?://)[^\s/@:]+:[^\s/@]+@"
+    ).unwrap();
+    static ref REDACT_HOME_PATH_RE: Regex = Regex::new(
+        r"(?:/home|/Users)/[^/\s]+"
+    ).unwrap();
+    static ref REDACT_WINDOWS_HOME_PATH_RE: Regex = Regex::new(
+        r"(?i)[A-Z]:\\Users\\[^\\\s]+"
+    ).unwrap();
+    static ref REDACT_AUTHORIZATION_BEARER_RE: Regex = Regex::new(
+        r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+"
+    ).unwrap();
+    static ref REDACT_STANDALONE_BEARER_RE: Regex = Regex::new(
+        r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+"
+    ).unwrap();
+    static ref REDACT_GITHUB_TOKEN_RE: Regex = Regex::new(
+        r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]+\b"
+    ).unwrap();
+    static ref REDACT_GITHUB_PAT_TOKEN_RE: Regex = Regex::new(
+        r"\bgithub_pat_[A-Za-z0-9_]+\b"
+    ).unwrap();
+    static ref REDACT_HF_TOKEN_RE: Regex = Regex::new(
+        r"\bhf_[A-Za-z0-9]+\b"
+    ).unwrap();
+    static ref REDACT_SLACK_TOKEN_RE: Regex = Regex::new(
+        r"\b(?:xoxb|xoxa|xoxp|xoxr|xoxs)-[A-Za-z0-9-]+\b"
+    ).unwrap();
+    static ref REDACT_SLACK_APP_TOKEN_RE: Regex = Regex::new(
+        r"\bxapp-[A-Za-z0-9-]+\b"
+    ).unwrap();
+    static ref REDACT_GOOGLE_API_KEY_RE: Regex = Regex::new(
+        r"\bAIza[0-9A-Za-z\-_]{10,}\b"
+    ).unwrap();
+    static ref REDACT_AWS_ACCESS_KEY_RE: Regex = Regex::new(
+        r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"
+    ).unwrap();
+    static ref REDACT_SK_ANT_TOKEN_RE: Regex = Regex::new(
+        r"\bsk-ant-[A-Za-z0-9\-_]+\b"
+    ).unwrap();
+    static ref REDACT_SK_TOKEN_RE: Regex = Regex::new(
+        r"\bsk-[A-Za-z0-9\-_]+\b"
+    ).unwrap();
+    static ref REDACT_JWT_RE: Regex = Regex::new(
+        r"\b[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"
+    ).unwrap();
+    static ref REDACT_SECRET_KV_RE: Regex = Regex::new(
+        r#"(?ix)
+        (
+            "?(?:password|passwd|secret|token|api_key|apikey|apiKey|access_token|refresh_token|client_secret|session_secret|private_key|aws_secret_access_key|secretAccessKey|x-api-key|api-key|anthropic-api-key|openai-api-key)"?
+            \s*[:=]\s*
+        )
+        (
+            "[^"]*"
+            |'[^']*'
+            |[^,\s}\]]+
+        )
+        "#
     ).unwrap();
 }
 
@@ -140,7 +205,7 @@ pub fn parse_log_line(line: &str) -> Option<LogEntry> {
             component,
             session_id,
             message,
-            raw: line.to_string(),
+            raw: Some(line.to_string()),
             cache_read,
             cache_write,
             hit_ratio,
@@ -157,7 +222,7 @@ pub fn parse_log_line(line: &str) -> Option<LogEntry> {
                 component: "general".to_string(),
                 session_id: String::new(),
                 message: rest,
-                raw: line.to_string(),
+                raw: Some(line.to_string()),
                 cache_read: None,
                 cache_write: None,
                 hit_ratio: None,
@@ -435,4 +500,205 @@ pub fn read_log_tail(path: &PathBuf, max_lines: usize) -> Vec<LogEntry> {
         .iter()
         .filter_map(|line| parse_log_line(line))
         .collect()
+}
+
+pub fn read_log_tail_capped(path: &PathBuf, max_lines: usize, max_bytes: u64) -> Vec<LogEntry> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let file_len = match file.seek(SeekFrom::End(0)) {
+        Ok(len) => len,
+        Err(_) => return Vec::new(),
+    };
+
+    if file_len == 0 {
+        return Vec::new();
+    }
+
+    let start = file_len.saturating_sub(max_bytes);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+
+    let mut tail_bytes = vec![0u8; (file_len - start) as usize];
+    if file.read_exact(&mut tail_bytes).is_err() {
+        return Vec::new();
+    }
+
+    let tail_slice = if start > 0 {
+        match tail_bytes.iter().position(|&b| b == b'\n') {
+            Some(index) if index + 1 < tail_bytes.len() => &tail_bytes[index + 1..],
+            _ => &[][..],
+        }
+    } else {
+        &tail_bytes[..]
+    };
+
+    let text = String::from_utf8_lossy(tail_slice);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+
+    lines[start..]
+        .iter()
+        .filter_map(|line| parse_log_line(line))
+        .collect()
+}
+
+pub fn redact_text(input: &str) -> String {
+    let mut out = input.to_string();
+    out = REDACT_PEM_PRIVATE_KEY_RE
+        .replace_all(&out, "[REDACTED PRIVATE KEY]")
+        .into_owned();
+    out = REDACT_URL_CREDENTIALS_RE
+        .replace_all(&out, "${1}[REDACTED]@")
+        .into_owned();
+    out = REDACT_AUTHORIZATION_BEARER_RE
+        .replace_all(&out, "${1}[REDACTED]")
+        .into_owned();
+    out = REDACT_STANDALONE_BEARER_RE
+        .replace_all(&out, "${1}[REDACTED]")
+        .into_owned();
+    out = REDACT_SECRET_KV_RE
+        .replace_all(&out, "${1}[REDACTED]")
+        .into_owned();
+
+    for regex in [
+        &*REDACT_GITHUB_TOKEN_RE,
+        &*REDACT_GITHUB_PAT_TOKEN_RE,
+        &*REDACT_HF_TOKEN_RE,
+        &*REDACT_SLACK_TOKEN_RE,
+        &*REDACT_SLACK_APP_TOKEN_RE,
+        &*REDACT_GOOGLE_API_KEY_RE,
+        &*REDACT_AWS_ACCESS_KEY_RE,
+        &*REDACT_SK_ANT_TOKEN_RE,
+        &*REDACT_SK_TOKEN_RE,
+        &*REDACT_JWT_RE,
+    ] {
+        out = regex.replace_all(&out, "[REDACTED]").into_owned();
+    }
+
+    out = REDACT_HOME_PATH_RE.replace_all(&out, "~").into_owned();
+    REDACT_WINDOWS_HOME_PATH_RE
+        .replace_all(&out, "~")
+        .into_owned()
+}
+
+pub fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+
+    let mut end = 0usize;
+    for (index, ch) in input.char_indices() {
+        let next = index + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+
+    input[..end].to_string()
+}
+
+pub fn redact_and_truncate_browser_entry(entry: LogEntry) -> LogEntry {
+    let message = truncate_utf8_bytes(&redact_text(&entry.message), LOG_ENTRY_MESSAGE_MAX_BYTES);
+    let raw = entry
+        .raw
+        .as_deref()
+        .map(redact_text)
+        .map(|value| truncate_utf8_bytes(&value, LOG_ENTRY_MESSAGE_MAX_BYTES));
+
+    LogEntry {
+        message,
+        raw,
+        ..entry
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn read_log_tail_capped_does_not_read_entries_beyond_byte_cap() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("magic-context.log");
+        let mut file = fs::File::create(&path).expect("create file");
+
+        writeln!(
+            file,
+            "[2026-06-08T00:00:00Z] [magic-context][old] old entry"
+        )
+        .expect("write old");
+        let filler = "x".repeat((LOG_TAIL_READ_CAP_BYTES as usize) + 128);
+        write!(file, "{filler}").expect("write filler");
+        writeln!(file).expect("newline");
+        writeln!(
+            file,
+            "[2026-06-08T00:00:01Z] [magic-context][new] new entry"
+        )
+        .expect("write new");
+        file.flush().expect("flush");
+
+        let entries = read_log_tail_capped(&path, 10, LOG_TAIL_READ_CAP_BYTES);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "new");
+        assert!(!entries.iter().any(|entry| entry.session_id == "old"));
+    }
+
+    #[test]
+    fn redact_text_hides_required_token_header_jwt_and_path_patterns() {
+        let input = concat!(
+            "token ghp_1234567890abcdef Authorization: Bearer secret-token ",
+            "Bearer abc.def.ghi jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature ",
+            "home /home/naadir/project hf_abcdef slack xoxb-123-456 ",
+            "google AIzaSy1234567890 aws AKIA1234567890ABCD ",
+            "url https://user:pass@example.com"
+        );
+
+        let redacted = redact_text(input);
+        for secret in [
+            "ghp_1234567890abcdef",
+            "secret-token",
+            "abc.def.ghi",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature",
+            "/home/naadir/project",
+            "hf_abcdef",
+            "xoxb-123-456",
+            "AIzaSy1234567890",
+            "AKIA1234567890ABCD",
+            "https://user:pass@example.com",
+        ] {
+            assert!(!redacted.contains(secret), "secret leaked: {secret}");
+        }
+        assert!(redacted.contains("Authorization: Bearer [REDACTED]"));
+        assert!(redacted.contains("Bearer [REDACTED]"));
+        assert!(redacted.contains("~/project"));
+        assert!(redacted.contains("https://[REDACTED]@example.com"));
+    }
+
+    #[test]
+    fn redaction_happens_before_truncation() {
+        let prefix = "a".repeat(LOG_ENTRY_MESSAGE_MAX_BYTES - 8);
+        let input = format!("{prefix} ghp_1234567890abcdef");
+
+        let output = truncate_utf8_bytes(&redact_text(&input), LOG_ENTRY_MESSAGE_MAX_BYTES);
+        assert!(!output.contains("ghp_1234567890abcdef"));
+        assert!(output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_is_utf8_safe() {
+        let input = "🙂🙂🙂";
+        let output = truncate_utf8_bytes(input, 5);
+        assert_eq!(output, "🙂");
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    }
 }

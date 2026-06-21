@@ -19,6 +19,7 @@ import type {
   DreamRunTask,
   ProjectInfo,
 } from "../../lib/types";
+import { isTauriRuntime } from "../../lib/runtime";
 
 type ProjectRunGroup = {
   project: ProjectInfo | undefined;
@@ -92,6 +93,9 @@ function hasMemoryChanges(changes: DreamRunMemoryChanges | null): changes is Dre
 }
 
 export default function DreamerPanel() {
+  const dreamerWritesAvailable = isTauriRuntime();
+  const dreamerWritesMessage =
+    "Dreamer writes are desktop-only until write parity lands.";
   const [queue, { refetch: refetchQueue }] = createResource(getDreamQueue);
   const [state, { refetch: refetchState }] = createResource(getDreamState);
   const [projects] = createResource(getProjects);
@@ -153,6 +157,7 @@ export default function DreamerPanel() {
   };
 
   const handleRunNow = async () => {
+    if (!dreamerWritesAvailable) return;
     let ids = knownProjectIds();
     if (ids.length === 0) {
       ids = (projects() ?? []).map((p) => p.identity);
@@ -166,6 +171,7 @@ export default function DreamerPanel() {
 
   const [removingQueueId, setRemovingQueueId] = createSignal<number | null>(null);
   const handleRemoveQueueEntry = async (id: number) => {
+    if (!dreamerWritesAvailable) return;
     if (removingQueueId() === id) return;
     setRemovingQueueId(id);
     try {
@@ -242,7 +248,13 @@ export default function DreamerPanel() {
       <div class="section-header">
         <h1 class="section-title">Dreamer</h1>
         <div class="section-actions">
-          <button type="button" class="btn primary sm" onClick={handleRunNow}>
+          <button
+            type="button"
+            class="btn primary sm"
+            onClick={handleRunNow}
+            disabled={!dreamerWritesAvailable}
+            title={!dreamerWritesAvailable ? dreamerWritesMessage : undefined}
+          >
             ▶ Run Now
           </button>
           <button type="button" class="btn sm" onClick={refreshAll}>
@@ -320,8 +332,12 @@ export default function DreamerPanel() {
                       type="button"
                       class="btn sm"
                       style={{ color: "var(--red)" }}
-                      disabled={removingQueueId() === entry.id}
-                      title="Remove this queued entry (use for stale entries whose project has no active runner)"
+                      disabled={!dreamerWritesAvailable || removingQueueId() === entry.id}
+                      title={
+                        !dreamerWritesAvailable
+                          ? dreamerWritesMessage
+                          : "Remove this queued entry (use for stale entries whose project has no active runner)"
+                      }
                       onClick={() => handleRemoveQueueEntry(entry.id)}
                     >
                       {removingQueueId() === entry.id ? "Removing…" : "Remove"}
@@ -569,6 +585,12 @@ export default function DreamerPanel() {
                                               label="Archived"
                                               items={detail().archived}
                                             />
+                                            <Show when={detail().truncated}>
+                                              <div class="dream-run-memory-detail-note">
+                                                Showing first {detail().limit ?? 0} memory-change records.
+                                                Open desktop app if you need full detail.
+                                              </div>
+                                            </Show>
                                           </div>
                                         )}
                                       </Show>
@@ -621,7 +643,11 @@ export default function DreamerPanel() {
           <div class="empty-state">
             <span class="empty-state-icon">🌙</span>
             <span>No dreamer activity</span>
-            <span style={{ "font-size": "11px" }}>Click "Run Now" to queue a dream task.</span>
+            <span style={{ "font-size": "11px" }}>
+              {!dreamerWritesAvailable
+                ? "Dreamer reads are available in browser; Dreamer writes require desktop app."
+                : 'Click "Run Now" to queue a dream task.'}
+            </span>
           </div>
         </Show>
       </div>

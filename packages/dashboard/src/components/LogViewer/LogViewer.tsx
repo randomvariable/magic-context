@@ -8,6 +8,7 @@ import {
   Show,
 } from "solid-js";
 import { getLogEntries, truncate } from "../../lib/api";
+import { isTauriRuntime } from "../../lib/runtime";
 import FilterSelect from "../shared/FilterSelect";
 
 export default function LogViewer() {
@@ -77,7 +78,8 @@ export default function LogViewer() {
     if (search) {
       e = e.filter(
         (entry) =>
-          entry.message.toLowerCase().includes(search) || entry.raw.toLowerCase().includes(search),
+          entry.message.toLowerCase().includes(search) ||
+          (entry.raw?.toLowerCase() ?? "").includes(search),
       );
     }
 
@@ -112,7 +114,14 @@ export default function LogViewer() {
   return (
     <>
       <div class="section-header">
-        <h1 class="section-title">Logs</h1>
+        <div>
+          <h1 class="section-title">Logs</h1>
+          <Show when={!isTauriRuntime()}>
+            <div style={{ color: "var(--text-secondary)", "font-size": "12px", "margin-top": "4px" }}>
+              Showing last 500 redacted log entries.
+            </div>
+          </Show>
+        </div>
         <div class="section-actions">
           <Show when={!paused()}>
             <span style={{ color: "var(--green)", "font-size": "12px", "margin-right": "8px" }}>
@@ -168,7 +177,11 @@ export default function LogViewer() {
               <div class="empty-state">
                 <span class="empty-state-icon">📋</span>
                 <span>No log entries found</span>
-                <span style={{ "font-size": "11px" }}>Log file: /tmp/magic-context.log</span>
+                <span style={{ "font-size": "11px" }}>
+                  {isTauriRuntime()
+                    ? "No local log entries available yet."
+                    : "No localhost dashboard log entries available yet."}
+                </span>
               </div>
             }
           >

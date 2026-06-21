@@ -1,16 +1,25 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(not(feature = "desktop"))]
+compile_error!("Desktop dashboard binary requires `desktop` feature. Use default features / `cargo tauri`, or build `--bin webserver --no-default-features --features webserver` for headless mode.");
+
+#[cfg(feature = "desktop")]
 use magic_context_dashboard_lib::{commands, AppState};
+#[cfg(feature = "desktop")]
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
 
+#[cfg(feature = "desktop")]
 const OPEN_DASHBOARD_MENU_ID: &str = "open_dashboard";
+#[cfg(feature = "desktop")]
 const CHECK_UPDATES_MENU_ID: &str = "check_updates";
+#[cfg(feature = "desktop")]
 const QUIT_MENU_ID: &str = "quit";
 
+#[cfg(feature = "desktop")]
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
@@ -19,6 +28,7 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+#[cfg(feature = "desktop")]
 fn main() {
     tauri::Builder::default()
         // shell plugin removed — no shell:default capability needed

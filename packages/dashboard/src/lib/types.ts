@@ -318,6 +318,8 @@ export interface DreamRunMemoryDetail {
   written: DreamMemoryChange[];
   archived: DreamMemoryChange[];
   merged: DreamMemoryChange[];
+  limit?: number;
+  truncated?: boolean;
 }
 
 export interface DreamRun {
@@ -339,7 +341,7 @@ export interface LogEntry {
   component: string;
   session_id: string;
   message: string;
-  raw: string;
+  raw: string | null;
   cache_read: number | null;
   cache_write: number | null;
   hit_ratio: number | null;

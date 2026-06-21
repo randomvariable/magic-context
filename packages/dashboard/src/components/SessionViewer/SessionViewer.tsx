@@ -1,4 +1,3 @@
-import { ask } from "@tauri-apps/plugin-dialog";
 import {
   createEffect,
   createMemo,
@@ -29,6 +28,8 @@ import {
   updateNote,
   updateSessionFact,
 } from "../../lib/api";
+import { ask } from "../../lib/dialog";
+import { isTauriRuntime } from "../../lib/runtime";
 import { severityColorClass } from "../../lib/cache-format";
 import type {
   Compartment,
@@ -151,6 +152,9 @@ type ActiveTab =
 type HarnessFilter = "all" | Harness;
 type SelectedSession = { harness: Harness; sessionId: string };
 
+const BROWSER_SESSION_MESSAGES_PREVIEW_LIMIT = 1000;
+const BROWSER_SESSION_CACHE_EVENTS_LIMIT = 600;
+
 // Module-level SWR cache for the project dropdown. `get_projects` is heavy (a
 // GROUP BY over the full opencode.db plus a recursive Pi session-dir walk), and
 // the whole panel unmounts on tab switch (App.tsx uses <Show>, not CSS hide),
@@ -188,6 +192,7 @@ function loadHarnessFilter(): HarnessFilter {
 }
 
 export default function SessionViewer() {
+  const browserPreviewMode = !isTauriRuntime();
   const [selectedSession, setSelectedSession] = createSignal<SelectedSession | null>(null);
   // Default to Compartments so opening a session doesn't pay the messages
   // fetch cost up front (37k+ rows / ~28MB IPC for long sessions). Messages
@@ -390,7 +395,11 @@ export default function SessionViewer() {
     cacheSource,
     async (selected) => {
       if (!selected) return [];
-      return getSessionCacheEvents(selected.harness, selected.sessionId);
+      return getSessionCacheEvents(
+        selected.harness,
+        selected.sessionId,
+        browserPreviewMode ? BROWSER_SESSION_CACHE_EVENTS_LIMIT : undefined,
+      );
     },
   );
   // Most-recent N events for the timeline (see cacheTimelineLimit above).
@@ -1052,6 +1061,15 @@ export default function SessionViewer() {
               fallback={<div class="empty-state">Loading messages…</div>}
             >
               <div class="list-gap">
+                <Show when={browserPreviewMode}>
+                  <div class="card" style={{ "border-left": "3px solid var(--amber)" }}>
+                    <div class="card-title">Browser preview</div>
+                    <div class="card-meta">
+                      Showing last {BROWSER_SESSION_MESSAGES_PREVIEW_LIMIT.toLocaleString()} messages
+                      only. Open desktop app for full session history.
+                    </div>
+                  </div>
+                </Show>
                 <Show when={piCompactions().length > 0}>
                   <div class="card" style={{ "border-left": "3px solid var(--purple)" }}>
                     <div class="card-title">Pi compaction markers: {piCompactions().length}</div>
@@ -2336,6 +2354,15 @@ export default function SessionViewer() {
                 }
               >
                 <div class="list-gap">
+                  <Show when={browserPreviewMode}>
+                    <div class="card" style={{ "border-left": "3px solid var(--amber)" }}>
+                      <div class="card-title">Browser preview</div>
+                      <div class="card-meta">
+                        Session cache feed capped to {BROWSER_SESSION_CACHE_EVENTS_LIMIT} events
+                        in browser mode. Open desktop app for full session cache reads.
+                      </div>
+                    </div>
+                  </Show>
                   <div class="chart-container">
                     <div
                       style={{

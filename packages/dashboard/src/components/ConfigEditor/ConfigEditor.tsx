@@ -10,10 +10,12 @@ import {
 import {
   getConfig,
   getPiConfig,
+  getProjectConfig,
   getProjectConfigs,
   saveConfig,
   savePiConfig,
   saveProjectConfig,
+  testEmbeddingEndpoint,
 } from "../../lib/api";
 import type { ProjectConfigEntry } from "../../lib/types";
 import ModelSelect from "./ModelSelect";
@@ -363,6 +365,7 @@ function ConfigForm(props: {
     ok: boolean;
     message: string;
   } | null>(null);
+  const [embeddingTestInFlight, setEmbeddingTestInFlight] = createSignal(false);
 
   /**
    * Structured outcome returned by the Rust probe (mirrors the `EmbeddingProbeOutcome`
@@ -839,10 +842,16 @@ function ConfigForm(props: {
                                 </div>
 
                                 <div>
+                                  <div class="config-field-desc" style={{ "margin-bottom": "8px" }}>
+                                    Sends one explicit test request. Browser localhost mode applies
+                                    SSRF and response-size safety checks.
+                                  </div>
                                   <button
                                     type="button"
                                     class="btn sm"
+                                    disabled={embeddingTestInFlight()}
                                     onClick={async () => {
+                                      if (embeddingTestInFlight()) return;
                                       const endpoint = String(
                                         getNestedValue(formData(), "embedding.endpoint") ?? "",
                                       ).trim();
@@ -865,24 +874,22 @@ function ConfigForm(props: {
                                         });
                                         return;
                                       }
+                                      setEmbeddingTestInFlight(true);
                                       setEmbeddingTestResult({ ok: false, message: "Testing..." });
                                       try {
-                                        const { invoke } = await import("@tauri-apps/api/core");
                                         // Rust returns the structured outcome directly (not
                                         // `Result<T, String>` anymore). Any thrown error from
-                                        // `invoke` itself is a tauri infrastructure failure
-                                        // (e.g., command not registered) rather than a probe
-                                        // classification — we surface that unchanged.
-                                        const outcome = await invoke<EmbeddingProbeOutcome>(
-                                          "test_embedding_endpoint",
-                                          {
+                                        // backend/fetch infrastructure itself is not a probe
+                                        // classification (e.g. route/transport failure), so we
+                                        // surface that unchanged.
+                                        const outcome =
+                                          (await testEmbeddingEndpoint({
                                             endpoint,
                                             model,
                                             apiKey: apiKey || null,
                                             inputType: inputType || null,
                                             truncate: truncate || null,
-                                          },
-                                        );
+                                          })) as EmbeddingProbeOutcome;
                                         setEmbeddingTestResult(formatProbeOutcome(outcome));
                                       } catch (e: unknown) {
                                         setEmbeddingTestResult({
@@ -891,6 +898,8 @@ function ConfigForm(props: {
                                             (e as { message?: string })?.message ?? e,
                                           ),
                                         });
+                                      } finally {
+                                        setEmbeddingTestInFlight(false);
                                       }
                                     }}
                                   >
@@ -2122,11 +2131,7 @@ function ProjectConfigDetail(props: {
   const [config] = createResource(
     () => configPath(),
     async () => {
-      const { invoke } = await import("@tauri-apps/api/core");
-      return (await invoke("get_config", {
-        source: "project",
-        projectPath: props.entry.worktree,
-      })) as import("../../lib/types").ConfigFile;
+      return getProjectConfig(props.entry.worktree);
     },
   );
 
@@ -2179,7 +2184,12 @@ function ProjectConfigDetail(props: {
 
 // ── Main ConfigEditor ───────────────────────────────────────
 
-export default function ConfigEditor(props: { models: string[]; piModels: string[] }) {
+export default function ConfigEditor(props: {
+  models: string[];
+  piModels: string[];
+  onRefreshModels?: () => Promise<void> | void;
+  modelsRefreshing?: boolean;
+}) {
   const [configTarget, setConfigTarget] = createSignal<ConfigTarget>(loadUserConfigTab());
   const [userConfig, { refetch: refetchUser }] = createResource(() => getConfig("user"));
   const [piConfig, { refetch: refetchPi }] = createResource(getPiConfig);
@@ -2235,6 +2245,18 @@ export default function ConfigEditor(props: { models: string[]; piModels: string
       <div class="section-header">
         <h1 class="section-title">Configuration</h1>
         <div class="section-actions">
+          <Show when={props.onRefreshModels}>
+            <button
+              type="button"
+              class="btn sm"
+              disabled={Boolean(props.modelsRefreshing)}
+              onClick={() => {
+                void props.onRefreshModels?.();
+              }}
+            >
+              {props.modelsRefreshing ? "Refreshing Models..." : "↻ Refresh Models"}
+            </button>
+          </Show>
           <button
             type="button"
             class="btn sm"

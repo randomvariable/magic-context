@@ -1,11 +1,15 @@
+#[cfg(feature = "desktop")]
 pub mod commands;
 pub mod config;
 pub mod db;
 pub mod embedding_probe;
 pub mod log_parser;
+pub mod model_discovery;
 pub mod pi_sessions;
 pub mod process_ext;
 pub mod project_identity;
+pub mod services;
+pub mod webserver;
 pub mod workspaces;
 
 use std::path::PathBuf;

@@ -3404,7 +3404,7 @@ pub fn get_session_messages(
                 return Ok(Vec::new());
             };
             let conn = open_readonly(&opencode_db_path)?;
-            load_opencode_messages(&conn, session_id)
+            load_opencode_messages(&conn, session_id, None)
         }
         Harness::Pi => {
             let Some(path) = pi_sessions::find_pi_session_path(session_id) else {
@@ -3428,9 +3428,47 @@ pub fn get_session_messages(
     }
 }
 
+pub fn get_session_messages_limited(
+    harness: Harness,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<SessionMessageRow>, rusqlite::Error> {
+    match harness {
+        Harness::Opencode => {
+            let Some(opencode_db_path) = resolve_opencode_db_path() else {
+                return Ok(Vec::new());
+            };
+            let conn = open_readonly(&opencode_db_path)?;
+            load_opencode_messages(&conn, session_id, Some(limit))
+        }
+        Harness::Pi => {
+            let Some(path) = pi_sessions::find_pi_session_path(session_id) else {
+                return Ok(Vec::new());
+            };
+            let Some(detail) = pi_sessions::read_pi_session_detail(&path) else {
+                return Ok(Vec::new());
+            };
+            let start = detail.messages.len().saturating_sub(limit);
+            Ok(detail
+                .messages
+                .iter()
+                .skip(start)
+                .map(|message| SessionMessageRow {
+                    message_id: message.entry_id.clone(),
+                    timestamp_ms: message.timestamp_ms,
+                    role: message.role.clone(),
+                    text_preview: message.text_preview.clone(),
+                    raw_json: message.raw_json.clone(),
+                })
+                .collect())
+        }
+    }
+}
+
 pub fn get_project_key_files(
     conn: &Connection,
     project_path: &str,
+    limit: usize,
 ) -> Result<Vec<KeyFileRow>, rusqlite::Error> {
     // Resolve the identity filter to the set of stored project_path values so
     // symlinked / non-canonical / legacy raw paths still match (mirrors the
@@ -3458,9 +3496,17 @@ pub fn get_project_key_files(
                 generated_at, generated_by_model, generation_config_hash, stale_reason
            FROM project_key_files
           WHERE project_path IN ({placeholders})
-          ORDER BY generated_at DESC, path ASC"
+          ORDER BY generated_at DESC, path ASC
+          LIMIT ?{}",
+        paths.len() + 1
     ))?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(paths.iter()), |row| {
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(paths.len() + 1);
+    for path in &paths {
+        params.push(path);
+    }
+    let limit_i64 = limit as i64;
+    params.push(&limit_i64);
+    let rows = stmt.query_map(params.as_slice(), |row| {
         Ok(KeyFileRow {
             project_path: row.get(0)?,
             path: row.get(1)?,
@@ -3537,7 +3583,7 @@ pub fn get_opencode_session_detail(
         .unwrap_or(0);
 
     let compartments = conn
-        .map(|c| get_compartments(c, &session_id))
+        .map(|c| get_compartments(c, &session_id, usize::MAX))
         .transpose()?
         .unwrap_or_default();
     let facts = conn
@@ -3584,7 +3630,26 @@ pub fn get_opencode_session_detail(
 fn load_opencode_messages(
     conn: &Connection,
     session_id: &str,
+    limit: Option<usize>,
 ) -> Result<Vec<SessionMessageRow>, rusqlite::Error> {
+    fn map_message_row(row: &rusqlite::Row<'_>) -> Result<SessionMessageRow, rusqlite::Error> {
+        let raw_string: String = row.get(3)?;
+        let raw_json: serde_json::Value = serde_json::from_str(&raw_string).unwrap_or_default();
+        let aggregated_text: String = row.get(4)?;
+        let text_preview = if aggregated_text.is_empty() {
+            preview_from_json(&raw_json)
+        } else {
+            normalize_preview(&aggregated_text)
+        };
+        Ok(SessionMessageRow {
+            message_id: row.get(0)?,
+            timestamp_ms: row.get(1)?,
+            role: row.get(2)?,
+            text_preview,
+            raw_json,
+        })
+    }
+
     // OpenCode stores message metadata (role, time, agent, model) on the `message` table
     // but the actual text content lives in the separate `part` table joined by `message_id`.
     // Each part has its own JSON shape — `type=text` parts have a `text` field; other types
@@ -3595,7 +3660,28 @@ fn load_opencode_messages(
     //
     // The `||` operator concatenates SQL strings; `||` with NULL produces NULL, so we wrap
     // json_extract in COALESCE to handle non-text parts (which return NULL for `$.text`).
-    let mut stmt = conn.prepare(
+    let query = if limit.is_some() {
+        "SELECT * FROM (
+            SELECT
+            CAST(m.id AS TEXT),
+            m.time_created,
+            COALESCE(CAST(json_extract(m.data, '$.role') AS TEXT), ''),
+            m.data,
+            COALESCE(
+                (SELECT GROUP_CONCAT(json_extract(p.data, '$.text'), ' ')
+                 FROM part p
+                 WHERE p.message_id = m.id
+                   AND json_extract(p.data, '$.type') = 'text'
+                   AND json_extract(p.data, '$.text') IS NOT NULL),
+                ''
+            ) AS aggregated_text
+         FROM message m
+         WHERE m.session_id = ?1
+         ORDER BY m.time_created DESC
+         LIMIT ?2
+         ) recent
+         ORDER BY time_created ASC"
+    } else {
         "SELECT
             CAST(m.id AS TEXT),
             m.time_created,
@@ -3611,27 +3697,14 @@ fn load_opencode_messages(
             ) AS aggregated_text
          FROM message m
          WHERE m.session_id = ?1
-         ORDER BY m.time_created ASC",
-    )?;
-    let rows = stmt.query_map([session_id], |row| {
-        let raw_string: String = row.get(3)?;
-        let raw_json: serde_json::Value = serde_json::from_str(&raw_string).unwrap_or_default();
-        let aggregated_text: String = row.get(4)?;
-        // Use aggregated parts text when present; fall back to legacy in-message content
-        // (covers any future schema variants where text might live on the message row).
-        let text_preview = if aggregated_text.is_empty() {
-            preview_from_json(&raw_json)
-        } else {
-            normalize_preview(&aggregated_text)
-        };
-        Ok(SessionMessageRow {
-            message_id: row.get(0)?,
-            timestamp_ms: row.get(1)?,
-            role: row.get(2)?,
-            text_preview,
-            raw_json,
-        })
-    })?;
+         ORDER BY m.time_created ASC"
+    };
+    let mut stmt = conn.prepare(query)?;
+    let rows = if let Some(limit) = limit {
+        stmt.query_map(rusqlite::params![session_id, limit as i64], map_message_row)?
+    } else {
+        stmt.query_map([session_id], map_message_row)?
+    };
     rows.collect()
 }
 
@@ -3699,7 +3772,7 @@ pub fn get_pi_session_detail(conn: Option<&Connection>, session_id: &str) -> Opt
         .count() as i64;
 
     let compartments = conn
-        .and_then(|c| get_compartments(c, session_id).ok())
+        .and_then(|c| get_compartments(c, session_id, usize::MAX).ok())
         .unwrap_or_default();
     let facts = conn
         .and_then(|c| get_session_facts(c, session_id).ok())
@@ -3828,6 +3901,7 @@ fn resolve_session_info(
 pub fn get_compartments(
     conn: &Connection,
     session_id: &str,
+    limit: usize,
 ) -> Result<Vec<Compartment>, rusqlite::Error> {
     // v2 tiered compartments: read the paraphrase tiers (p1–p4), the
     // decay-rate `importance`, and `episode_type` directly off the row.
@@ -3839,10 +3913,11 @@ pub fn get_compartments(
                 c.importance, c.episode_type, c.p1, c.p2, c.p3, c.p4, c.legacy
          FROM compartments c
          WHERE c.session_id = ?1
-         ORDER BY c.sequence DESC",
+         ORDER BY c.sequence DESC
+         LIMIT ?2",
     )?;
     let mut compartments: Vec<Compartment> = stmt
-        .query_map(rusqlite::params![session_id], |row| {
+        .query_map(rusqlite::params![session_id, limit as i64], |row| {
             Ok(Compartment {
                 id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -4009,6 +4084,7 @@ pub fn dismiss_note(conn: &Connection, note_id: i64) -> Result<usize, rusqlite::
 pub fn get_smart_notes(
     conn: &Connection,
     project_path: &str,
+    limit: usize,
 ) -> Result<Vec<Note>, rusqlite::Error> {
     // Smart notes are stored under the resolved project identity; resolve the
     // filter to all stored paths that normalize to it so symlinked / legacy raw
@@ -4022,10 +4098,18 @@ pub fn get_smart_notes(
         "SELECT id, type, status, content, session_id, project_path, surface_condition,
                 created_at, updated_at, last_checked_at, ready_at, ready_reason
          FROM notes
-         WHERE project_path IN ({placeholders}) AND type = 'smart' AND status != 'dismissed'
-         ORDER BY created_at ASC"
+          WHERE project_path IN ({placeholders}) AND type = 'smart' AND status != 'dismissed'
+         ORDER BY created_at ASC
+         LIMIT ?{}",
+        paths.len() + 1
     ))?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(paths.iter()), |row| {
+    let limit_i64 = limit as i64;
+    let mut query_params: Vec<&dyn rusqlite::ToSql> = paths
+        .iter()
+        .map(|path| path as &dyn rusqlite::ToSql)
+        .collect();
+    query_params.push(&limit_i64);
+    let rows = stmt.query_map(rusqlite::params_from_iter(query_params), |row| {
         Ok(Note {
             id: row.get(0)?,
             note_type: row.get(1)?,
@@ -4084,6 +4168,7 @@ pub fn get_session_meta(
 pub fn get_subagent_invocations(
     conn: &Connection,
     session_id: &str,
+    limit: usize,
 ) -> Result<Vec<SubagentInvocation>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT id, session_id, harness, subagent, task, provider_id, model_id,
@@ -4091,9 +4176,10 @@ pub fn get_subagent_invocations(
                 cache_read_tokens, cache_write_tokens, error, parent_invocation_id
          FROM subagent_invocations
          WHERE session_id = ?1
-         ORDER BY started_at DESC",
+         ORDER BY started_at DESC
+         LIMIT ?2",
     )?;
-    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+    let rows = stmt.query_map(rusqlite::params![session_id, limit as i64], |row| {
         Ok(SubagentInvocation {
             id: row.get(0)?,
             session_id: row.get(1)?,
@@ -4119,6 +4205,7 @@ pub fn get_subagent_invocations(
 pub fn get_subagent_totals_by_subagent(
     conn: &Connection,
     session_id: &str,
+    limit: usize,
 ) -> Result<Vec<SubagentTotals>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT subagent, COUNT(*), COALESCE(SUM(input_tokens), 0),
@@ -4127,9 +4214,10 @@ pub fn get_subagent_totals_by_subagent(
          FROM subagent_invocations
          WHERE session_id = ?1
          GROUP BY subagent
-         ORDER BY subagent",
+         ORDER BY subagent
+         LIMIT ?2",
     )?;
-    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+    let rows = stmt.query_map(rusqlite::params![session_id, limit as i64], |row| {
         Ok(SubagentTotals {
             subagent: row.get(0)?,
             invocations: row.get(1)?,
@@ -4162,9 +4250,13 @@ pub fn get_dream_queue(conn: &Connection) -> Result<Vec<DreamQueueEntry>, rusqli
     rows.collect()
 }
 
-pub fn get_dream_state(conn: &Connection) -> Result<Vec<DreamStateEntry>, rusqlite::Error> {
-    let mut stmt = conn.prepare("SELECT key, value FROM dream_state")?;
-    let rows = stmt.query_map([], |row| {
+pub fn get_dream_state(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<DreamStateEntry>, rusqlite::Error> {
+    let normalized_limit = std::cmp::max(limit, 1) as i64;
+    let mut stmt = conn.prepare("SELECT key, value FROM dream_state ORDER BY key ASC LIMIT ?1")?;
+    let rows = stmt.query_map(rusqlite::params![normalized_limit], |row| {
         Ok(DreamStateEntry {
             key: row.get(0)?,
             value: row.get(1)?,
@@ -4274,6 +4366,10 @@ pub struct DreamRunMemoryDetail {
     pub written: Vec<DreamMemoryChange>,
     pub archived: Vec<DreamMemoryChange>,
     pub merged: Vec<DreamMemoryChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }
 
 /// Reconstruct WHICH memories a dream run changed, by time-window over the run's
@@ -4288,7 +4384,9 @@ pub struct DreamRunMemoryDetail {
 pub fn get_dream_run_memory_changes(
     conn: &Connection,
     run_id: i64,
+    limit: usize,
 ) -> Result<DreamRunMemoryDetail, String> {
+    let normalized_limit = std::cmp::max(limit, 1);
     let (project_path, started_at, finished_at): (String, i64, i64) = conn
         .query_row(
             "SELECT project_path, started_at, finished_at FROM dream_runs WHERE id = ?1",
@@ -4312,19 +4410,34 @@ pub fn get_dream_run_memory_changes(
             AND (
                   (created_at >= ?{c1} AND created_at <= ?{c2})
                OR (updated_at >= ?{c1} AND updated_at <= ?{c2})
-            )",
+            )
+          ORDER BY updated_at DESC, created_at DESC, id DESC
+          LIMIT ?{limit_idx}",
         c1 = paths.len() + 1,
         c2 = paths.len() + 2,
+        limit_idx = paths.len() + 3,
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut params: Vec<&dyn rusqlite::ToSql> =
         paths.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
     params.push(&started_at);
     params.push(&finished_at);
+    let query_limit = (normalized_limit + 1) as i64;
+    params.push(&query_limit);
 
-    let mut detail = DreamRunMemoryDetail::default();
+    let mut detail = DreamRunMemoryDetail {
+        limit: Some(normalized_limit),
+        truncated: Some(false),
+        ..DreamRunMemoryDetail::default()
+    };
     let mut rows = stmt.query(params.as_slice()).map_err(|e| e.to_string())?;
+    let mut seen = 0_usize;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        if seen == normalized_limit {
+            detail.truncated = Some(true);
+            break;
+        }
+        seen += 1;
         let id: i64 = row.get(0).map_err(|e| e.to_string())?;
         let category: String = row.get(1).map_err(|e| e.to_string())?;
         let content: String = row.get(2).map_err(|e| e.to_string())?;
@@ -4495,6 +4608,7 @@ pub struct UserMemoryCandidate {
 pub fn get_user_memories(
     conn: &Connection,
     status_filter: Option<&str>,
+    limit: usize,
 ) -> Result<Vec<UserMemory>, rusqlite::Error> {
     let mut conditions = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -4503,6 +4617,9 @@ pub fn get_user_memories(
         params.push(Box::new(s.to_string()));
         conditions.push(format!("status = ?{}", params.len()));
     }
+
+    params.push(Box::new(limit as i64));
+    let limit_param = params.len();
 
     let where_clause = if conditions.is_empty() {
         String::new()
@@ -4514,8 +4631,9 @@ pub fn get_user_memories(
         "SELECT id, content, status, promoted_at, source_candidate_ids, created_at, updated_at
          FROM user_memories
          {}
-         ORDER BY created_at DESC",
-        where_clause
+         ORDER BY created_at DESC
+         LIMIT ?{}",
+        where_clause, limit_param
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -4539,13 +4657,15 @@ pub fn get_user_memories(
 
 pub fn get_user_memory_candidates(
     conn: &Connection,
+    limit: usize,
 ) -> Result<Vec<UserMemoryCandidate>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT id, content, session_id, source_compartment_start, source_compartment_end, created_at
          FROM user_memory_candidates
-         ORDER BY created_at DESC",
+         ORDER BY created_at DESC
+         LIMIT ?1",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![limit as i64], |row| {
         Ok(UserMemoryCandidate {
             id: row.get(0)?,
             content: row.get(1)?,
@@ -4558,7 +4678,7 @@ pub fn get_user_memory_candidates(
     rows.collect()
 }
 
-pub fn dismiss_user_memory(conn: &mut Connection, id: i64) -> Result<(), rusqlite::Error> {
+pub fn dismiss_user_memory(conn: &mut Connection, id: i64) -> Result<bool, rusqlite::Error> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let affected = tx.execute(
         "UPDATE user_memories SET status = 'dismissed', updated_at = ?1 WHERE id = ?2",
@@ -4568,24 +4688,24 @@ pub fn dismiss_user_memory(conn: &mut Connection, id: i64) -> Result<(), rusqlit
         bump_project_user_profile_version(&tx)?;
     }
     tx.commit()?;
-    Ok(())
+    Ok(affected > 0)
 }
 
-pub fn delete_user_memory(conn: &mut Connection, id: i64) -> Result<(), rusqlite::Error> {
+pub fn delete_user_memory(conn: &mut Connection, id: i64) -> Result<bool, rusqlite::Error> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let affected = tx.execute("DELETE FROM user_memories WHERE id = ?1", params![id])?;
     if affected > 0 {
         bump_project_user_profile_version(&tx)?;
     }
     tx.commit()?;
-    Ok(())
+    Ok(affected > 0)
 }
 
 pub fn update_user_memory_content(
     conn: &mut Connection,
     id: i64,
     content: &str,
-) -> Result<(), rusqlite::Error> {
+) -> Result<bool, rusqlite::Error> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let affected = tx.execute(
         "UPDATE user_memories SET content = ?1, updated_at = ?2 WHERE id = ?3",
@@ -4598,20 +4718,24 @@ pub fn update_user_memory_content(
         bump_project_user_profile_version(&tx)?;
     }
     tx.commit()?;
-    Ok(())
+    Ok(affected > 0)
 }
 
 pub fn delete_user_memory_candidate(conn: &Connection, id: i64) -> Result<(), rusqlite::Error> {
-    conn.execute(
+    let affected = conn.execute(
         "DELETE FROM user_memory_candidates WHERE id = ?1",
         params![id],
     )?;
+    if affected == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
     Ok(())
 }
 
 pub fn promote_user_memory_candidate(
     conn: &mut Connection,
     id: i64,
+    content_max_bytes: usize,
 ) -> Result<(), rusqlite::Error> {
     let now = now_millis();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4621,6 +4745,10 @@ pub fn promote_user_memory_candidate(
         params![id],
         |row| row.get(0),
     )?;
+
+    if content.len() > content_max_bytes {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
 
     tx.execute(
         "INSERT INTO user_memories
@@ -4906,7 +5034,7 @@ mod load_messages_tests {
             r#"{"type":"text","text":"hello world"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages = load_opencode_messages(&conn, "ses_test", None).expect("load");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].text_preview, "hello world");
@@ -4931,7 +5059,7 @@ mod load_messages_tests {
             r#"{"type":"text","text":"second chunk"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages = load_opencode_messages(&conn, "ses_test", None).expect("load");
         assert_eq!(messages.len(), 1);
         // GROUP_CONCAT does not guarantee order across SQLite versions; both
         // halves must be present and joined by the configured separator.
@@ -4980,7 +5108,7 @@ mod load_messages_tests {
             r#"{"type":"text","text":"public answer"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages = load_opencode_messages(&conn, "ses_test", None).expect("load");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text_preview, "public answer");
         assert!(!messages[0].text_preview.contains("internal thinking"));
@@ -4999,7 +5127,7 @@ mod load_messages_tests {
             r#"{"type":"tool","callID":"x","tool":"read"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages = load_opencode_messages(&conn, "ses_test", None).expect("load");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text_preview, "");
     }
@@ -5024,7 +5152,7 @@ mod load_messages_tests {
             r#"{"type":"text","text":"early"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages = load_opencode_messages(&conn, "ses_test", None).expect("load");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].text_preview, "early");
         assert_eq!(messages[1].text_preview, "late");
@@ -5043,7 +5171,7 @@ mod load_messages_tests {
             &format!(r#"{{"type":"text","text":"{}"}}"#, long_text),
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages = load_opencode_messages(&conn, "ses_test", None).expect("load");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text_preview.chars().count(), 500);
     }
@@ -5068,7 +5196,7 @@ mod load_messages_tests {
             r#"{"type":"text","text":"text for b"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages = load_opencode_messages(&conn, "ses_test", None).expect("load");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].text_preview, "text for a");
         assert_eq!(messages[1].text_preview, "text for b");

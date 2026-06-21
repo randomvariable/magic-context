@@ -363,12 +363,71 @@ fn dismiss_user_memory_bumps_global_user_profile_not_project_memory_epoch() {
     let id = conn.last_insert_rowid();
     seed_project_state(&conn, "git:project-a", 4, 0);
 
-    db::dismiss_user_memory(&mut conn, id).expect("dismiss");
+    assert!(db::dismiss_user_memory(&mut conn, id).expect("dismiss"));
 
     assert_eq!(memory_epoch(&conn, "__global__"), 0);
     assert_eq!(user_profile_version(&conn, "__global__"), 1);
     assert_eq!(memory_epoch(&conn, "git:project-a"), 4);
     assert_eq!(user_profile_version(&conn, "git:project-a"), 0);
+}
+
+#[test]
+fn delete_user_memory_bumps_global_profile_version_and_deletes_row() {
+    let mut conn = make_db();
+    conn.execute(
+        "INSERT INTO user_memories (content, status, promoted_at, source_candidate_ids, created_at, updated_at)
+         VALUES ('remove me', 'active', 1, '[]', 1, 1)",
+        [],
+    )
+    .expect("insert user memory");
+    let id = conn.last_insert_rowid();
+    seed_project_state(&conn, "__global__", 0, 7);
+    seed_project_state(&conn, "git:project-a", 4, 2);
+
+    assert!(db::delete_user_memory(&mut conn, id).expect("delete"));
+
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM user_memories WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .expect("remaining row count");
+    assert_eq!(remaining, 0);
+    assert_eq!(user_profile_version(&conn, "__global__"), 8);
+    assert_eq!(memory_epoch(&conn, "__global__"), 0);
+    assert_eq!(memory_epoch(&conn, "git:project-a"), 4);
+    assert_eq!(user_profile_version(&conn, "git:project-a"), 2);
+}
+
+#[test]
+fn update_user_memory_content_bumps_global_profile_version_and_preserves_exact_content() {
+    let mut conn = make_db();
+    conn.execute(
+        "INSERT INTO user_memories (content, status, promoted_at, source_candidate_ids, created_at, updated_at)
+         VALUES ('old content', 'active', 1, '[]', 1, 1)",
+        [],
+    )
+    .expect("insert user memory");
+    let id = conn.last_insert_rowid();
+    seed_project_state(&conn, "__global__", 0, 11);
+    seed_project_state(&conn, "git:project-a", 9, 3);
+    let updated = "  exact replacement\nwith newline and trailing spaces  ";
+
+    assert!(db::update_user_memory_content(&mut conn, id, updated).expect("update content"));
+
+    let stored: String = conn
+        .query_row(
+            "SELECT content FROM user_memories WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .expect("stored content");
+    assert_eq!(stored, updated);
+    assert_eq!(user_profile_version(&conn, "__global__"), 12);
+    assert_eq!(memory_epoch(&conn, "__global__"), 0);
+    assert_eq!(memory_epoch(&conn, "git:project-a"), 9);
+    assert_eq!(user_profile_version(&conn, "git:project-a"), 3);
 }
 
 #[test]
@@ -383,7 +442,7 @@ fn promote_user_memory_candidate_maps_columns_and_bumps_global_profile() {
     .expect("insert candidate");
     let candidate_id = conn.last_insert_rowid();
 
-    db::promote_user_memory_candidate(&mut conn, candidate_id).expect("promote");
+    db::promote_user_memory_candidate(&mut conn, candidate_id, 64 * 1024).expect("promote");
 
     let row: (String, String, String) = conn
         .query_row(
@@ -679,7 +738,8 @@ fn get_smart_notes_tolerates_null_project_path_rows() {
     .expect("insert smart note");
 
     // Must not error on the NULL row, and must return the smart note.
-    let notes = db::get_smart_notes(&conn, "git:abc123").expect("get_smart_notes must not crash");
+    let notes =
+        db::get_smart_notes(&conn, "git:abc123", 50).expect("get_smart_notes must not crash");
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0].content, "smart note");
 }

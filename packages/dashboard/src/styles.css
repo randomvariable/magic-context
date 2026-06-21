@@ -1374,6 +1374,12 @@ body {
   color: var(--danger, #d9534f);
 }
 
+.dream-run-memory-detail-note {
+  margin-top: -4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 .dream-run-memory-detail-retry {
   margin-left: 6px;
   padding: 1px 8px;

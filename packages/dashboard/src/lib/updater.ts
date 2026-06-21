@@ -1,15 +1,23 @@
-import { ask, message } from "@tauri-apps/plugin-dialog";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { check, type Update } from "@tauri-apps/plugin-updater";
+import { ask, message } from "./dialog";
+import { isTauriRuntime } from "./runtime";
 
-let cachedUpdate: Update | null = null;
+type CachedUpdate = {
+  version: string;
+  download: () => Promise<void>;
+  install: () => Promise<void>;
+};
+
+let cachedUpdate: CachedUpdate | null = null;
 
 /**
  * Check if an update is available. Returns the version string if found, null otherwise.
  * Used by the background polling in App.tsx for the toast notification.
  */
 export async function checkForUpdate(): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+
   try {
+    const { check } = await import("@tauri-apps/plugin-updater");
     const update = await check();
     if (update) {
       cachedUpdate = update;
@@ -26,8 +34,9 @@ export async function checkForUpdate(): Promise<string | null> {
  * Called when user clicks "Install & Restart" in the toast.
  */
 export async function installAndRelaunch(): Promise<void> {
-  if (!cachedUpdate) return;
+  if (!isTauriRuntime() || !cachedUpdate) return;
   try {
+    const { relaunch } = await import("@tauri-apps/plugin-process");
     await cachedUpdate.download();
     await cachedUpdate.install();
     await relaunch();
@@ -42,8 +51,11 @@ export async function installAndRelaunch(): Promise<void> {
  * Following OpenCode's pattern: check → download → ask → install → relaunch.
  */
 export async function runUpdater({ alertOnFail }: { alertOnFail: boolean }) {
-  let update: Awaited<ReturnType<typeof check>> | undefined;
+  if (!isTauriRuntime()) return;
+
+  let update: CachedUpdate | null;
   try {
+    const { check } = await import("@tauri-apps/plugin-updater");
     update = await check();
   } catch {
     if (alertOnFail) {
@@ -83,5 +95,6 @@ export async function runUpdater({ alertOnFail }: { alertOnFail: boolean }) {
     return;
   }
 
+  const { relaunch } = await import("@tauri-apps/plugin-process");
   await relaunch();
 }

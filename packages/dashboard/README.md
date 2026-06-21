@@ -1,6 +1,13 @@
 # Magic Context Dashboard
 
-A lightweight Tauri desktop app that provides visibility into Magic Context's internal state, configuration, and diagnostics.
+Magic Context dashboard supports two local runtimes:
+
+- **Tauri desktop app** — packaged desktop shell
+- **Localhost webserver** — Rust API/static server on `127.0.0.1`, browser UI from built `dist/`
+
+The desktop app is the full-featured runtime. Localhost webserver mode is an
+incremental browser runtime: it serves the dashboard UI locally and exposes the
+HTTP API surface implemented so far.
 
 ## Features
 
@@ -10,6 +17,22 @@ A lightweight Tauri desktop app that provides visibility into Magic Context's in
 - **Dreamer Management** — Monitor and trigger dream tasks
 - **Configuration Editor** — Visual editor for `magic-context.jsonc`
 - **Log Viewer** — Real-time log tail with filtering and cache hit indicators
+
+## Runtime coverage
+
+**Desktop app:** full dashboard feature set.
+
+**Localhost webserver:** currently supports the implemented `/api/*` surface:
+
+- DB health and project list
+- Memory Browser reads and memory CRUD actions
+- Core session list/detail routes
+
+Some dashboard areas still rely on Tauri IPC and remain desktop-only until later
+API phases, including config editing/probing, dreamer management, logs/cache
+detail, user-memory management, session messages, subagent detail, and some
+session subviews. In browser mode those areas may be hidden, degraded, or fail
+until their APIs are migrated.
 
 ## Prerequisites
 
@@ -25,11 +48,92 @@ cd packages/dashboard
 # Install frontend dependencies
 bun install
 
-# Run in development mode (hot-reload frontend + Rust backend)
+# Desktop development mode (hot-reload frontend + Rust backend)
 cargo tauri dev
 
-# Build for production
+# Desktop production build
 cargo tauri build
+```
+
+## Localhost webserver mode
+
+### Security model
+
+Localhost mode is for **same-machine use only**.
+
+- Server binds `127.0.0.1:1422` by default
+- Browser assets are served locally from built dashboard `dist/`
+- API stays under `POST /api/{command}`
+- API requests still enforce local `Host` / `Origin` checks
+- Protected, sensitive, and mutating API calls require `X-Magic-Context-Token`
+- Legacy `X-Magic-Context-Local: 1` no longer authorizes protected commands
+- No permissive CORS is added for LAN/Internet use
+
+Do **not** expose this server to LAN, reverse proxy, or public Internet.
+
+### Production-like localhost usage
+
+Build frontend first, then start Rust webserver:
+
+```bash
+cd packages/dashboard
+
+bun run build
+bun run server:web
+```
+
+Or one command:
+
+```bash
+bun run serve:web
+```
+
+To build both the frontend and webserver binary before launching:
+
+```bash
+bun run serve:web:all
+```
+
+Then open:
+
+```text
+http://127.0.0.1:1422
+```
+
+If `dist/` is missing, server returns a clear build-missing page instead of panicking.
+
+### Dev mode with Vite proxy
+
+Run Rust localhost API server plus Vite dev server:
+
+```bash
+cd packages/dashboard
+
+bun run dev:web
+```
+
+This starts:
+
+- Rust localhost server on `127.0.0.1:1422`
+- Vite frontend dev server on `127.0.0.1:1420`
+
+`dev:web` now generates one random local token and passes it to both the Rust
+server and Vite frontend automatically. You do not need to set matching token
+env vars by hand.
+
+Vite proxies `/api` to Rust server in dev mode.
+
+If you want split terminals instead:
+
+```bash
+# use one shared token for both terminals
+TOKEN=$(bun -e "console.log(crypto.randomUUID())")
+
+# terminal 1
+MAGIC_CONTEXT_DASHBOARD_TOKEN=$TOKEN bun run server:web
+
+# terminal 2
+VITE_MAGIC_CONTEXT_DASHBOARD_TOKEN=$TOKEN bun run dev:frontend
 ```
 
 ## Architecture
@@ -46,7 +150,7 @@ packages/dashboard/
 │   │   ├── LogViewer/      # Real-time log tail
 │   │   └── Layout/         # App shell, nav, status bar
 │   ├── lib/
-│   │   ├── api.ts          # Tauri invoke wrappers
+│   │   ├── api.ts          # Browser/Tauri backend transport wrappers
 │   │   └── types.ts        # TypeScript types matching Rust structs
 │   ├── App.tsx             # Root component with navigation
 │   ├── index.tsx           # Entry point
@@ -55,10 +159,14 @@ packages/dashboard/
 │   ├── src/
 │   │   ├── main.rs         # Tauri app setup + command registration
 │   │   ├── lib.rs          # Shared state
-│   │   ├── commands.rs     # All Tauri command handlers
+│   │   ├── commands.rs     # Tauri command handlers
+│   │   ├── services.rs     # Shared service layer for Tauri + localhost server
+│   │   ├── webserver.rs    # Localhost API + static asset server
 │   │   ├── db.rs           # SQLite reader + writer
 │   │   ├── config.rs       # Config file reader + writer
 │   │   └── log_parser.rs   # Log file parser + cache event extraction
+│   ├── src/bin/
+│   │   └── webserver.rs    # Headless localhost webserver entrypoint
 │   ├── Cargo.toml
 │   └── tauri.conf.json
 ├── index.html
@@ -74,6 +182,12 @@ The dashboard reads from the same SQLite database the plugin writes to:
 - **Logs**: `/tmp/magic-context.log`
 
 Database access uses WAL mode for safe concurrent reads while the plugin writes. Write operations (memory edits, dream queue entries) use `busy_timeout` to handle contention.
+
+In localhost mode, static routes are served from `packages/dashboard/dist/`. Resolution prefers `MAGIC_CONTEXT_DASHBOARD_DIST` when set, then common relative locations such as:
+
+- `packages/dashboard/dist`
+- `src-tauri/../dist`
+- repo-root `packages/dashboard/dist`
 
 ## Design
 

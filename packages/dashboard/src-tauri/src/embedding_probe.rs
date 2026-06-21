@@ -9,9 +9,11 @@
 //! whichever tool they prefer without running into "it works in doctor but
 //! fails in the dashboard" surprises.
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use reqwest::Url;
 use serde::Serialize;
 
 /// Structured probe outcome. Matches the kinds produced by the Node probe so
@@ -47,6 +49,8 @@ pub enum EmbeddingProbeOutcome {
         /// users need to know which var is missing.
         token: String,
     },
+    /// Resolved config value is invalid after `{env:...}` / `{file:...}` expansion.
+    InvalidConfigField { field: String, message: String },
 }
 
 /// Options passed to the Rust probe. Mirrors the Node `EmbeddingProbeOptions`.
@@ -63,6 +67,8 @@ pub struct EmbeddingProbeOptions {
 }
 
 const MAX_PREVIEW_CHARS: usize = 240;
+const BROWSER_PROBE_RESPONSE_MAX_BYTES: usize = 512 * 1024;
+const BROWSER_PROBE_CONNECT_TIMEOUT_MS: u64 = 3_000;
 
 /// Substitute `{env:VAR}` and `{file:path}` tokens in a single value string.
 ///
@@ -322,6 +328,603 @@ pub async fn probe_embedding_endpoint(options: EmbeddingProbeOptions) -> Embeddi
     }
 }
 
+/// Browser-safe embedding probe. Applies tighter SSRF, redirect, body-size,
+/// and secret-redaction controls than the desktop command surface.
+pub async fn probe_embedding_endpoint_browser(
+    options: EmbeddingProbeOptions,
+) -> EmbeddingProbeOutcome {
+    let prepared = match prepare_browser_probe_options(options) {
+        Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
+    };
+
+    let validated = match validate_browser_endpoint(&prepared.endpoint).await {
+        Ok(validated) => validated,
+        Err(outcome) => return sanitize_outcome(outcome, prepared.api_key.as_deref()),
+    };
+
+    let client = match build_browser_probe_client(&validated, prepared.timeout_ms) {
+        Ok(client) => client,
+        Err(error) => {
+            return sanitize_outcome(
+                EmbeddingProbeOutcome::NetworkError {
+                    message: format!("Failed to create HTTP client: {error}"),
+                },
+                prepared.api_key.as_deref(),
+            );
+        }
+    };
+
+    let mut body = serde_json::json!({
+        "model": prepared.model,
+        "input": "magic-context probe",
+    });
+    if let Some(map) = body.as_object_mut() {
+        if let Some(input_type) = prepared.input_type.as_deref() {
+            map.insert(
+                "input_type".to_string(),
+                serde_json::Value::String(input_type.to_string()),
+            );
+        }
+        if let Some(truncate) = prepared.truncate.as_deref() {
+            map.insert(
+                "truncate".to_string(),
+                serde_json::Value::String(truncate.to_string()),
+            );
+        }
+    }
+
+    let mut req = client
+        .post(validated.embeddings_url)
+        .header("Content-Type", "application/json")
+        .json(&body);
+    if let Some(api_key) = prepared.api_key.as_deref() {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+
+    let response = match req.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            if error.is_timeout() {
+                return EmbeddingProbeOutcome::Timeout {
+                    timeout_ms: prepared.timeout_ms,
+                };
+            }
+            return sanitize_outcome(
+                EmbeddingProbeOutcome::NetworkError {
+                    message: format_error_with_causes(&error),
+                },
+                prepared.api_key.as_deref(),
+            );
+        }
+    };
+
+    let status = response.status();
+    let status_u16 = status.as_u16();
+
+    if status.is_redirection() {
+        return sanitize_outcome(
+            EmbeddingProbeOutcome::HttpError {
+                status: status_u16,
+                preview: "redirect responses are not followed".to_string(),
+            },
+            prepared.api_key.as_deref(),
+        );
+    }
+
+    if response
+        .content_length()
+        .is_some_and(|len| len > BROWSER_PROBE_RESPONSE_MAX_BYTES as u64)
+    {
+        return sanitize_outcome(
+            oversized_response_outcome(status_u16),
+            prepared.api_key.as_deref(),
+        );
+    }
+
+    let body_bytes = match read_response_body_capped(response).await {
+        Ok(bytes) => bytes,
+        Err(outcome) => {
+            return sanitize_outcome(outcome, prepared.api_key.as_deref());
+        }
+    };
+
+    let body_text = String::from_utf8_lossy(&body_bytes).into_owned();
+    if status.is_success() {
+        let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&body_bytes);
+        match parsed {
+            Ok(value) => match extract_dimensions(&value) {
+                Some(dimensions) => EmbeddingProbeOutcome::Ok {
+                    status: status_u16,
+                    dimensions: Some(dimensions),
+                },
+                None => sanitize_outcome(
+                    EmbeddingProbeOutcome::EndpointUnsupported {
+                        status: status_u16,
+                        preview: truncate_preview(&body_text),
+                    },
+                    prepared.api_key.as_deref(),
+                ),
+            },
+            Err(_) => sanitize_outcome(
+                EmbeddingProbeOutcome::EndpointUnsupported {
+                    status: status_u16,
+                    preview: truncate_preview(&body_text),
+                },
+                prepared.api_key.as_deref(),
+            ),
+        }
+    } else {
+        let preview = truncate_preview(&body_text);
+        let outcome = match status_u16 {
+            401 | 403 => EmbeddingProbeOutcome::AuthFailed {
+                status: status_u16,
+                preview,
+            },
+            404 | 405 => EmbeddingProbeOutcome::EndpointUnsupported {
+                status: status_u16,
+                preview,
+            },
+            _ => EmbeddingProbeOutcome::HttpError {
+                status: status_u16,
+                preview,
+            },
+        };
+        sanitize_outcome(outcome, prepared.api_key.as_deref())
+    }
+}
+
+#[derive(Debug)]
+struct ValidatedBrowserEndpoint {
+    embeddings_url: String,
+    resolve_domain: Option<String>,
+    resolved_addrs: Vec<SocketAddr>,
+}
+
+fn build_browser_probe_client(
+    validated: &ValidatedBrowserEndpoint,
+    timeout_ms: u64,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .connect_timeout(Duration::from_millis(BROWSER_PROBE_CONNECT_TIMEOUT_MS))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+
+    if let Some(domain) = validated.resolve_domain.as_deref() {
+        builder = builder.resolve_to_addrs(domain, &validated.resolved_addrs);
+    }
+
+    builder.build()
+}
+
+async fn validate_browser_endpoint(
+    endpoint: &str,
+) -> Result<ValidatedBrowserEndpoint, EmbeddingProbeOutcome> {
+    if endpoint.is_empty() || !(endpoint.starts_with("https://") || endpoint.starts_with("http://"))
+    {
+        return Err(EmbeddingProbeOutcome::InvalidScheme {
+            endpoint: endpoint.to_string(),
+        });
+    }
+
+    let url = Url::parse(endpoint).map_err(|_| EmbeddingProbeOutcome::InvalidScheme {
+        endpoint: endpoint.to_string(),
+    })?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(browser_ssrf_rejection(
+            "only http and https endpoints are allowed",
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(browser_ssrf_rejection(
+            "endpoint URL must not include userinfo",
+        ));
+    }
+    if url.query().is_some() {
+        return Err(browser_ssrf_rejection(
+            "endpoint URL must not include query parameters",
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(browser_ssrf_rejection(
+            "endpoint URL must not include fragments",
+        ));
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| browser_ssrf_rejection("endpoint URL must include a host"))?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let is_exact_loopback = is_exact_loopback_host(host);
+
+    if scheme == "http" && !is_exact_loopback {
+        return Err(browser_ssrf_rejection(
+            "http endpoints must use localhost, 127.0.0.1, or [::1]",
+        ));
+    }
+
+    let (resolve_domain, resolved_addrs) = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_disallowed_ip(ip, !is_exact_loopback) {
+            return Err(browser_ssrf_rejection(
+                "endpoint host resolves to a disallowed address",
+            ));
+        }
+        (None, Vec::new())
+    } else {
+        let addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|error| EmbeddingProbeOutcome::NetworkError {
+                message: format!("DNS resolution failed: {error}"),
+            })?;
+        let mut validated_addrs = Vec::new();
+        let mut saw_any = false;
+        for addr in addrs {
+            saw_any = true;
+            if is_disallowed_ip(addr.ip(), !is_exact_loopback) {
+                return Err(browser_ssrf_rejection(
+                    "endpoint host resolves to a disallowed address",
+                ));
+            }
+            validated_addrs.push(addr);
+        }
+        if !saw_any {
+            return Err(EmbeddingProbeOutcome::NetworkError {
+                message: "DNS resolution returned no addresses".to_string(),
+            });
+        }
+        (Some(host.to_ascii_lowercase()), validated_addrs)
+    };
+
+    Ok(ValidatedBrowserEndpoint {
+        embeddings_url: format!("{}/embeddings", endpoint.trim_end_matches('/')),
+        resolve_domain,
+        resolved_addrs,
+    })
+}
+
+fn prepare_browser_probe_options(
+    mut options: EmbeddingProbeOptions,
+) -> Result<EmbeddingProbeOptions, EmbeddingProbeOutcome> {
+    let field_specs = [
+        ("endpoint", options.endpoint.as_str()),
+        ("model", options.model.as_str()),
+        ("api_key", options.api_key.as_deref().unwrap_or_default()),
+        (
+            "input_type",
+            options.input_type.as_deref().unwrap_or_default(),
+        ),
+        ("truncate", options.truncate.as_deref().unwrap_or_default()),
+    ];
+    for (field, raw) in field_specs {
+        if let Some(token) = find_file_token(raw) {
+            return Err(EmbeddingProbeOutcome::UnresolvedToken {
+                field: field.to_string(),
+                token,
+            });
+        }
+    }
+
+    let (endpoint, endpoint_residual) = substitute_value(&options.endpoint, None);
+    let (model, model_residual) = substitute_value(&options.model, None);
+    let (api_key, api_key_residual) = match options.api_key.as_deref() {
+        Some(value) => {
+            let (resolved, residual) = substitute_value(value, None);
+            (Some(resolved), residual)
+        }
+        None => (None, None),
+    };
+    let (input_type, input_type_residual) = match options.input_type.as_deref() {
+        Some(value) => {
+            let (resolved, residual) = substitute_value(value, None);
+            (Some(resolved), residual)
+        }
+        None => (None, None),
+    };
+    let (truncate, truncate_residual) = match options.truncate.as_deref() {
+        Some(value) => {
+            let (resolved, residual) = substitute_value(value, None);
+            (Some(resolved), residual)
+        }
+        None => (None, None),
+    };
+
+    for (field, residual) in [
+        ("endpoint", endpoint_residual),
+        ("model", model_residual),
+        ("api_key", api_key_residual),
+        ("input_type", input_type_residual),
+        ("truncate", truncate_residual),
+    ] {
+        if let Some(token) = residual {
+            return Err(EmbeddingProbeOutcome::UnresolvedToken {
+                field: field.to_string(),
+                token,
+            });
+        }
+    }
+
+    options.endpoint = endpoint.trim().to_string();
+    options.model = model.trim().to_string();
+    options.api_key = api_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    options.input_type = input_type
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    options.truncate = truncate
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    validate_resolved_browser_probe_field(&options.endpoint, "endpoint", 2048, true)?;
+    validate_resolved_browser_probe_field(&options.model, "model", 512, true)?;
+    if let Some(api_key) = options.api_key.as_deref() {
+        validate_resolved_browser_probe_field(api_key, "apiKey", 8192, false)?;
+    }
+    if let Some(input_type) = options.input_type.as_deref() {
+        validate_resolved_browser_probe_field(input_type, "inputType", 128, true)?;
+    }
+    if let Some(truncate) = options.truncate.as_deref() {
+        validate_resolved_browser_probe_field(truncate, "truncate", 128, true)?;
+    }
+
+    Ok(options)
+}
+
+fn validate_resolved_browser_probe_field(
+    value: &str,
+    field: &str,
+    max_bytes: usize,
+    reject_all_controls: bool,
+) -> Result<(), EmbeddingProbeOutcome> {
+    let has_disallowed_control = if reject_all_controls {
+        value.chars().any(char::is_control)
+    } else {
+        value
+            .chars()
+            .any(|ch| matches!(ch, '\r' | '\n' | '\0') || (ch.is_control() && ch != '\t'))
+    };
+    if has_disallowed_control {
+        return Err(EmbeddingProbeOutcome::InvalidConfigField {
+            field: field.to_string(),
+            message: "contains control characters".to_string(),
+        });
+    }
+    if value.len() > max_bytes {
+        return Err(EmbeddingProbeOutcome::InvalidConfigField {
+            field: field.to_string(),
+            message: format!("exceeds max length of {max_bytes} bytes"),
+        });
+    }
+    if contains_file_token(value) {
+        return Err(EmbeddingProbeOutcome::InvalidConfigField {
+            field: field.to_string(),
+            message: "contains unsupported {file:...} token".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn contains_file_token(input: &str) -> bool {
+    input.contains("{file:")
+}
+
+fn display_token_for_error(token: &str) -> String {
+    if token.starts_with("{file:") {
+        "{file:...}".to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+async fn read_response_body_capped(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, EmbeddingProbeOutcome> {
+    let mut body = Vec::new();
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| EmbeddingProbeOutcome::NetworkError {
+                message: format!("failed to read response body: {error}"),
+            })?
+    {
+        if body.len() + chunk.len() > BROWSER_PROBE_RESPONSE_MAX_BYTES {
+            return Err(oversized_response_outcome(response.status().as_u16()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn oversized_response_outcome(status: u16) -> EmbeddingProbeOutcome {
+    if (200..300).contains(&status) {
+        EmbeddingProbeOutcome::EndpointUnsupported {
+            status,
+            preview: "response too large".to_string(),
+        }
+    } else {
+        EmbeddingProbeOutcome::HttpError {
+            status,
+            preview: "response too large".to_string(),
+        }
+    }
+}
+
+fn browser_ssrf_rejection(reason: &str) -> EmbeddingProbeOutcome {
+    EmbeddingProbeOutcome::NetworkError {
+        message: format!("Outbound probe blocked: {reason}"),
+    }
+}
+
+fn sanitize_outcome(
+    outcome: EmbeddingProbeOutcome,
+    api_key: Option<&str>,
+) -> EmbeddingProbeOutcome {
+    match outcome {
+        EmbeddingProbeOutcome::Ok { status, dimensions } => {
+            EmbeddingProbeOutcome::Ok { status, dimensions }
+        }
+        EmbeddingProbeOutcome::AuthFailed { status, preview } => {
+            EmbeddingProbeOutcome::AuthFailed {
+                status,
+                preview: sanitize_text(&preview, api_key),
+            }
+        }
+        EmbeddingProbeOutcome::EndpointUnsupported { status, preview } => {
+            EmbeddingProbeOutcome::EndpointUnsupported {
+                status,
+                preview: sanitize_text(&preview, api_key),
+            }
+        }
+        EmbeddingProbeOutcome::HttpError { status, preview } => EmbeddingProbeOutcome::HttpError {
+            status,
+            preview: sanitize_text(&preview, api_key),
+        },
+        EmbeddingProbeOutcome::NetworkError { message } => EmbeddingProbeOutcome::NetworkError {
+            message: sanitize_text(&message, api_key),
+        },
+        EmbeddingProbeOutcome::Timeout { timeout_ms } => {
+            EmbeddingProbeOutcome::Timeout { timeout_ms }
+        }
+        EmbeddingProbeOutcome::InvalidScheme { endpoint } => EmbeddingProbeOutcome::InvalidScheme {
+            endpoint: sanitize_text(&endpoint, api_key),
+        },
+        EmbeddingProbeOutcome::UnresolvedToken { field, token } => {
+            EmbeddingProbeOutcome::UnresolvedToken {
+                field,
+                token: display_token_for_error(&token),
+            }
+        }
+        EmbeddingProbeOutcome::InvalidConfigField { field, message } => {
+            EmbeddingProbeOutcome::InvalidConfigField { field, message }
+        }
+    }
+}
+
+fn sanitize_text(input: &str, api_key: Option<&str>) -> String {
+    use regex::Regex;
+
+    let mut text = input
+        .chars()
+        .map(|ch| {
+            if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+
+    if let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
+        text = text.replace(api_key, "[redacted]");
+    }
+
+    let patterns = [
+        (
+            r#"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s"']+"#,
+            "$1[redacted]",
+        ),
+        (
+            r"(?i)(bearer\s+)(sk(?:-ant)?-[A-Za-z0-9_\-]+)",
+            "$1[redacted]",
+        ),
+        (r"\bsk-ant-[A-Za-z0-9_\-]+\b", "[redacted]"),
+        (r"\bsk-[A-Za-z0-9_\-]+\b", "[redacted]"),
+        (
+            r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b",
+            "[redacted]",
+        ),
+        (
+            r#"(?i)(\b(?:api[_-]?key|apikey|token|secret|authorization)\b\s*[:=]\s*["']?)[^\s,"'}]+"#,
+            "$1[redacted]",
+        ),
+        (r"(?i)([a-z][a-z0-9+\-.]*://)[^/@\s]+@", "$1[redacted]@"),
+    ];
+
+    for (pattern, replacement) in patterns {
+        let regex = Regex::new(pattern).expect("valid redaction regex");
+        text = regex.replace_all(&text, replacement).into_owned();
+    }
+
+    text
+}
+
+fn find_file_token(raw: &str) -> Option<String> {
+    let start = raw.find("{file:")?;
+    let rest = &raw[start..];
+    let end = rest.find('}')?;
+    Some(rest[..=end].to_string())
+}
+
+fn is_exact_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+fn is_disallowed_ip(ip: std::net::IpAddr, reject_loopback: bool) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => is_disallowed_ipv4(ipv4, reject_loopback),
+        std::net::IpAddr::V6(ipv6) => is_disallowed_ipv6(ipv6, reject_loopback),
+    }
+}
+
+fn is_disallowed_ipv4(ip: std::net::Ipv4Addr, reject_loopback: bool) -> bool {
+    if reject_loopback && ip.is_loopback() {
+        return true;
+    }
+    if ip.is_unspecified()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+    {
+        return true;
+    }
+    let [a, b, c, _d] = ip.octets();
+    matches!(
+        (a, b, c),
+        (0, _, _)
+            | (100, 64..=127, _)
+            | (169, 254, _)
+            | (172, 16..=31, _)
+            | (192, 0, 0)
+            | (192, 0, 2)
+            | (192, 88, 99)
+            | (192, 168, _)
+            | (198, 18..=19, _)
+            | (198, 51, 100)
+            | (203, 0, 113)
+    ) || a >= 224
+}
+
+fn is_disallowed_ipv6(ip: std::net::Ipv6Addr, reject_loopback: bool) -> bool {
+    if (reject_loopback && ip.is_loopback()) || ip.is_unspecified() || ip.is_multicast() {
+        return true;
+    }
+    let segments = ip.segments();
+    let first = segments[0];
+    let top_byte = (first >> 8) as u8;
+    if (top_byte & 0xfe) == 0xfc {
+        return true;
+    }
+    if (top_byte == 0xfe) && ((first & 0x00c0) == 0x0080) {
+        return true;
+    }
+    if segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff {
+        return is_disallowed_ipv4(
+            std::net::Ipv4Addr::new(
+                (segments[6] >> 8) as u8,
+                segments[6] as u8,
+                (segments[7] >> 8) as u8,
+                segments[7] as u8,
+            ),
+            reject_loopback,
+        );
+    }
+    false
+}
+
 fn extract_dimensions(body: &serde_json::Value) -> Option<usize> {
     let data = body.get("data")?.as_array()?;
     let first = data.first()?;
@@ -379,6 +982,11 @@ fn truncate_preview(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{routing::post, Json, Router};
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn substitute_leaves_text_without_tokens_untouched() {
@@ -618,5 +1226,233 @@ mod tests {
             outcome,
             EmbeddingProbeOutcome::InvalidScheme { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn browser_probe_times_out_with_bounded_timeout() {
+        let (addr, handle) = spawn_test_server(Router::new().route(
+            "/v1/embeddings",
+            post(|| async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Json(serde_json::json!({ "data": [{ "embedding": [0.1, 0.2] }] }))
+            }),
+        ))
+        .await;
+
+        let outcome = probe_embedding_endpoint_browser(EmbeddingProbeOptions {
+            endpoint: format!("http://127.0.0.1:{}/v1", addr.port()),
+            model: "timeout-model".to_string(),
+            api_key: None,
+            input_type: None,
+            truncate: None,
+            timeout_ms: 25,
+        })
+        .await;
+
+        assert!(matches!(
+            outcome,
+            EmbeddingProbeOutcome::Timeout { timeout_ms: 25 }
+        ));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn browser_probe_stops_chunked_response_after_size_cap() {
+        let hit_count = Arc::new(AtomicUsize::new(0));
+        let hit_count_clone = hit_count.clone();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind raw server");
+        let addr = listener.local_addr().expect("raw server addr");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            hit_count_clone.fetch_add(1, Ordering::SeqCst);
+            let headers = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+            socket.write_all(headers).await.expect("write headers");
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..10 {
+                socket
+                    .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .expect("write chunk size");
+                socket.write_all(&chunk).await.expect("write chunk body");
+                socket.write_all(b"\r\n").await.expect("write chunk tail");
+            }
+            socket.write_all(b"0\r\n\r\n").await.expect("write eof");
+        });
+
+        let outcome = probe_embedding_endpoint_browser(EmbeddingProbeOptions {
+            endpoint: format!("http://127.0.0.1:{}/v1", addr.port()),
+            model: "chunked-model".to_string(),
+            api_key: None,
+            input_type: None,
+            truncate: None,
+            timeout_ms: 2_000,
+        })
+        .await;
+
+        match outcome {
+            EmbeddingProbeOutcome::EndpointUnsupported { preview, .. } => {
+                assert_eq!(preview, "response too large");
+            }
+            other => panic!("expected oversized endpoint_unsupported, got {other:?}"),
+        }
+        assert_eq!(hit_count.load(Ordering::SeqCst), 1);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn browser_probe_client_uses_pinned_dns_override_addrs() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let (addr, handle) = spawn_test_server(Router::new().route(
+            "/v1/embeddings",
+            post(move || {
+                let hits = hits_clone.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({ "data": [{ "embedding": [0.1, 0.2] }] }))
+                }
+            }),
+        ))
+        .await;
+
+        let validated = ValidatedBrowserEndpoint {
+            embeddings_url: "http://does-not-resolve.invalid/v1/embeddings".to_string(),
+            resolve_domain: Some("does-not-resolve.invalid".to_string()),
+            resolved_addrs: vec![SocketAddr::from(([127, 0, 0, 1], addr.port()))],
+        };
+        let client = build_browser_probe_client(&validated, 1_000).expect("client");
+
+        let response = client
+            .post(&validated.embeddings_url)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "model": "m", "input": "magic-context probe" }))
+            .send()
+            .await
+            .expect("pinned request");
+
+        assert!(response.status().is_success());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn validate_browser_endpoint_allows_exact_localhost_dns_loopback_resolution() {
+        let validated = validate_browser_endpoint("http://localhost:11434/v1")
+            .await
+            .expect("localhost endpoint should validate");
+
+        assert_eq!(validated.resolve_domain.as_deref(), Some("localhost"));
+        assert!(
+            !validated.resolved_addrs.is_empty(),
+            "localhost should resolve to at least one socket addr"
+        );
+        assert!(validated
+            .resolved_addrs
+            .iter()
+            .all(|addr| addr.ip().is_loopback()));
+    }
+
+    #[test]
+    fn browser_probe_post_env_validation_rejects_resolved_file_tokens_and_caps() {
+        std::env::set_var(
+            "MC_TEST_EMBED_ENDPOINT_LONG",
+            format!("https://example.com/{}", "x".repeat(2048)),
+        );
+        std::env::set_var("MC_TEST_EMBED_MODEL_LONG", "x".repeat(513));
+        std::env::set_var("MC_TEST_EMBED_KEY_LONG", "k".repeat(8193));
+        std::env::set_var("MC_TEST_EMBED_KEY_CTRL", "abc\ndef");
+        std::env::set_var("MC_TEST_EMBED_FILE_TOKEN", "{file:/very/secret/path}");
+
+        let endpoint_err = prepare_browser_probe_options(EmbeddingProbeOptions {
+            endpoint: "{env:MC_TEST_EMBED_ENDPOINT_LONG}".to_string(),
+            model: "ok".to_string(),
+            api_key: None,
+            input_type: None,
+            truncate: None,
+            timeout_ms: 100,
+        })
+        .expect_err("endpoint overflow should fail");
+        assert!(
+            matches!(endpoint_err, EmbeddingProbeOutcome::InvalidConfigField { ref field, .. } if field == "endpoint")
+        );
+
+        let model_err = prepare_browser_probe_options(EmbeddingProbeOptions {
+            endpoint: "https://example.com/v1".to_string(),
+            model: "{env:MC_TEST_EMBED_MODEL_LONG}".to_string(),
+            api_key: None,
+            input_type: None,
+            truncate: None,
+            timeout_ms: 100,
+        })
+        .expect_err("model overflow should fail");
+        assert!(
+            matches!(model_err, EmbeddingProbeOutcome::InvalidConfigField { ref field, .. } if field == "model")
+        );
+
+        let api_key_err = prepare_browser_probe_options(EmbeddingProbeOptions {
+            endpoint: "https://example.com/v1".to_string(),
+            model: "ok".to_string(),
+            api_key: Some("{env:MC_TEST_EMBED_KEY_LONG}".to_string()),
+            input_type: None,
+            truncate: None,
+            timeout_ms: 100,
+        })
+        .expect_err("api key overflow should fail");
+        assert!(
+            matches!(api_key_err, EmbeddingProbeOutcome::InvalidConfigField { ref field, .. } if field == "apiKey")
+        );
+
+        let api_key_ctrl_err = prepare_browser_probe_options(EmbeddingProbeOptions {
+            endpoint: "https://example.com/v1".to_string(),
+            model: "ok".to_string(),
+            api_key: Some("{env:MC_TEST_EMBED_KEY_CTRL}".to_string()),
+            input_type: None,
+            truncate: None,
+            timeout_ms: 100,
+        })
+        .expect_err("api key control chars should fail");
+        assert!(
+            matches!(api_key_ctrl_err, EmbeddingProbeOutcome::InvalidConfigField { ref field, ref message } if field == "apiKey" && message.contains("control characters"))
+        );
+
+        let file_token_err = prepare_browser_probe_options(EmbeddingProbeOptions {
+            endpoint: "https://example.com/v1".to_string(),
+            model: "ok".to_string(),
+            api_key: Some("{env:MC_TEST_EMBED_FILE_TOKEN}".to_string()),
+            input_type: None,
+            truncate: None,
+            timeout_ms: 100,
+        })
+        .expect_err("resolved file token should fail");
+        match file_token_err {
+            EmbeddingProbeOutcome::InvalidConfigField { field, message } => {
+                assert_eq!(field, "apiKey");
+                assert_eq!(message, "contains unsupported {file:...} token");
+            }
+            other => panic!("expected invalid config field, got {other:?}"),
+        }
+
+        for key in [
+            "MC_TEST_EMBED_ENDPOINT_LONG",
+            "MC_TEST_EMBED_MODEL_LONG",
+            "MC_TEST_EMBED_KEY_LONG",
+            "MC_TEST_EMBED_KEY_CTRL",
+            "MC_TEST_EMBED_FILE_TOKEN",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    async fn spawn_test_server(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("server addr");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, handle)
     }
 }

@@ -1,4 +1,3 @@
-import { listen } from "@tauri-apps/api/event";
 import { createResource, createSignal, ErrorBoundary, onCleanup, onMount, Show } from "solid-js";
 import CacheDiagnostics from "./components/CacheDiagnostics/CacheDiagnostics";
 import ConfigEditor from "./components/ConfigEditor/ConfigEditor";
@@ -11,6 +10,7 @@ import SessionViewer from "./components/SessionViewer/SessionViewer";
 import UserMemories from "./components/UserMemories/UserMemories";
 import WorkspacesPanel from "./components/WorkspacesPanel/WorkspacesPanel";
 import { getAvailableModels, getAvailablePiModels, getDbHealth } from "./lib/api";
+import { isTauriRuntime } from "./lib/runtime";
 import type { NavSection } from "./lib/types";
 import { checkForUpdate, installAndRelaunch, runUpdater } from "./lib/updater";
 
@@ -41,38 +41,40 @@ export default function App() {
   const [health] = createResource(getDbHealth);
   const [availableModels, setAvailableModels] = createSignal<string[]>(loadCachedModels());
   const [availablePiModels, setAvailablePiModels] = createSignal<string[]>(loadCachedPiModels());
+  const [modelsRefreshing, setModelsRefreshing] = createSignal(false);
   const [updateVersion, setUpdateVersion] = createSignal<string | null>(null);
   const [updateInstalling, setUpdateInstalling] = createSignal(false);
   const [updateDismissed, setUpdateDismissed] = createSignal(false);
 
-  // Background model refresh
-  onMount(() => {
-    getAvailableModels()
-      .then((fresh) => {
-        setAvailableModels(fresh);
-        try {
-          localStorage.setItem(MODELS_CACHE_KEY, JSON.stringify(fresh));
-        } catch {}
-      })
-      .catch(() => {
-        /* keep cached */
-      });
+  const refreshModelDiscovery = async () => {
+    setModelsRefreshing(true);
+    try {
+      const [freshModels, freshPiModels] = await Promise.all([
+        getAvailableModels().catch(() => availableModels()),
+        getAvailablePiModels().catch(() => availablePiModels()),
+      ]);
+      setAvailableModels(freshModels);
+      setAvailablePiModels(freshPiModels);
+      try {
+        localStorage.setItem(MODELS_CACHE_KEY, JSON.stringify(freshModels));
+        localStorage.setItem(PI_MODELS_CACHE_KEY, JSON.stringify(freshPiModels));
+      } catch {}
+    } finally {
+      setModelsRefreshing(false);
+    }
+  };
 
-    getAvailablePiModels()
-      .then((fresh) => {
-        setAvailablePiModels(fresh);
-        try {
-          localStorage.setItem(PI_MODELS_CACHE_KEY, JSON.stringify(fresh));
-        } catch {}
-      })
-      .catch(() => {
-        /* keep cached */
-      });
+  // Background model refresh (desktop only)
+  onMount(() => {
+    if (!isTauriRuntime()) return;
+    void refreshModelDiscovery();
   });
 
   // Background update polling
   let updateInterval: ReturnType<typeof setInterval> | undefined;
   onMount(() => {
+    if (!isTauriRuntime()) return;
+
     const poll = () => {
       if (updateVersion()) return; // already found
       checkForUpdate().then((version) => {
@@ -90,11 +92,20 @@ export default function App() {
   // Listen for "Check for Updates" tray menu event
   let unlistenUpdate: (() => void) | undefined;
   onMount(() => {
-    listen("check-for-updates", () => {
-      runUpdater({ alertOnFail: true });
-    }).then((unlisten) => {
-      unlistenUpdate = unlisten;
-    });
+    if (!isTauriRuntime()) return;
+
+    import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen("check-for-updates", () => {
+          runUpdater({ alertOnFail: true });
+        }),
+      )
+      .then((unlisten) => {
+        unlistenUpdate = unlisten;
+      })
+      .catch(() => {
+        unlistenUpdate = undefined;
+      });
   });
   onCleanup(() => {
     unlistenUpdate?.();
@@ -168,7 +179,12 @@ export default function App() {
             <UserMemories />
           </Show>
           <Show when={activeSection() === "config"}>
-            <ConfigEditor models={availableModels()} piModels={availablePiModels()} />
+            <ConfigEditor
+              models={availableModels()}
+              piModels={availablePiModels()}
+              onRefreshModels={refreshModelDiscovery}
+              modelsRefreshing={modelsRefreshing()}
+            />
           </Show>
           <Show when={activeSection() === "logs"}>
             <LogViewer />

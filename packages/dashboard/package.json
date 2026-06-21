@@ -6,9 +6,13 @@
   "scripts": {
     "dev": "bunx tauri dev",
     "dev:frontend": "vite",
+    "dev:web": "sh -c 'token=$(bun -e \"console.log(crypto.randomUUID())\"); MAGIC_CONTEXT_DASHBOARD_TOKEN=$token bun run server:web & server_pid=$!; trap \"kill $server_pid\" EXIT INT TERM; VITE_MAGIC_CONTEXT_DASHBOARD_TOKEN=$token bun run dev:frontend'",
     "build": "vite build",
     "build:tauri": "bunx tauri build",
     "preview": "vite preview",
+    "server:web": "cargo run --manifest-path src-tauri/Cargo.toml --bin webserver --no-default-features --features webserver",
+    "serve:web": "sh -c 'bun run build && bun run server:web'",
+    "serve:web:all": "sh -c 'bun run build && cargo build --manifest-path src-tauri/Cargo.toml --bin webserver --no-default-features --features webserver && bun run server:web'",
     "tauri": "bunx tauri",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src",
